@@ -1,0 +1,138 @@
+@import "tailwindcss";
+
+/* Enables `dark:` utility variants driven by a `.dark` class on <html>,
+   rather than only the OS-level prefers-color-scheme media query. This lets
+   users pick Light / Dark / System independently of their OS setting. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #f6f7f9;
+  --surface: #ffffff;
+  --surface-hover: #f2f3f5;
+  --foreground: #1a1d23;
+  --muted: #667085;
+  --border: #e4e7ec;
+  --accent: #0e7c86;
+  --accent-hover: #0b6570;
+  --accent-soft: #e6f3f3;
+  --danger: #d92d20;
+  --danger-soft: #fde8e6;
+  --success: #12b76a;
+  --success-soft: #e3f9ee;
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+}
+
+.dark {
+  --background: #0e1013;
+  --surface: #17191d;
+  --surface-hover: #1e2126;
+  --foreground: #edeef0;
+  --muted: #8b93a1;
+  --border: #2a2d33;
+  --accent: #29b3ad;
+  --accent-hover: #35c9c2;
+  --accent-soft: #17302f;
+  --danger: #f2564a;
+  --danger-soft: #33191b;
+  --success: #32d583;
+  --success-soft: #123324;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --font-sans: var(--font-sans);
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  color-scheme: light;
+}
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+/* Mobile safe-area support (notches / home indicator) */
+@supports (padding: max(0px)) {
+  .safe-top {
+    padding-top: max(0.5rem, env(safe-area-inset-top));
+  }
+  .safe-bottom {
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  }
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Respect reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes step-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+.step-enter {
+  animation: step-in 220ms ease;
+}
+
+@keyframes skeleton-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+.skeleton {
+  animation: skeleton-pulse 1.5s ease-in-out infinite;
+  background-color: var(--border);
+  border-radius: 0.5rem;
+}

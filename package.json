@@ -1,0 +1,19 @@
+{
+  "name": "sakhya",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sakhya private real-time messaging and calling platform",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/build.mjs",
+    "start": "node scripts/start.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
