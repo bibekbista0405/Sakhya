@@ -10,6 +10,7 @@ export interface User {
   gender: string;
   createdAt: string;
   online?: boolean;
+  lastSeenAt?: string | null;
 }
 
 export interface Message {
@@ -35,6 +36,10 @@ export interface Message {
   decryptError?: boolean;
   securityCodeChanged?: boolean;
   expiresAt?: string | null;
+  isStarred?: boolean;
+  // Ephemeral client correlation id used only to reconcile the sender's
+  // local plaintext with the server echo. It is never persisted in SQLite.
+  clientMessageId?: string;
 }
 
 export interface Conversation {
@@ -76,6 +81,12 @@ export interface Notification {
   relatedId: string | null;
   isRead: number;
   createdAt: string;
+  // Only present on live socket-delivered notifications (not history fetches):
+  // lets the client show a richer OS notification when the user's preference
+  // is "full" but the server had to degrade the stored text because the
+  // message was encrypted — the client may already have the plaintext.
+  upgradableToFull?: boolean;
+  senderId?: string;
 }
 
 export interface IncomingCallData {
@@ -85,10 +96,12 @@ export interface IncomingCallData {
   caller: User;
 }
 
+export type NotificationContentLevel = "full" | "sender" | "generic" | "hidden";
+
 export interface PrivacySettings {
   readReceipts: boolean;
   typingIndicators: boolean;
   onlineStatus: boolean;
   lastSeenVisibility: "everyone" | "friends" | "nobody";
-  messagePreview: boolean;
+  notificationContentLevel: NotificationContentLevel;
 }

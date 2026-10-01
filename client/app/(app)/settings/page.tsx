@@ -2,7 +2,7 @@
 
 import { useEffect, useState, FormEvent } from "react";
 import Link from "next/link";
-import { Sun, Moon, Monitor, ShieldOff, Eye, EyeOff, ChevronRight } from "lucide-react";
+import { Sun, Moon, Monitor, Eye, EyeOff, ChevronRight, Star } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { PrivacySettings } from "@/types";
 import { useTheme, ThemeMode } from "@/hooks/useTheme";
@@ -12,6 +12,8 @@ import { Button } from "@/components/ui/Button";
 import { ErrorBanner } from "@/components/ui/ErrorBanner";
 import { cn } from "@/lib/utils";
 import { ChatLockSettings } from "@/components/settings/ChatLockSettings";
+import { getNotificationPermission, requestNotificationPermission } from "@/lib/browserNotifications";
+import { Bell } from "lucide-react";
 
 const THEME_OPTIONS: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
   { value: "light", label: "Light", icon: Sun },
@@ -27,6 +29,11 @@ export default function SettingsPage() {
   const [privacySaving, setPrivacySaving] = useState(false);
   const [privacyError, setPrivacyError] = useState<string | null>(null);
   const [privacySaved, setPrivacySaved] = useState(false);
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission | "unsupported">("default");
+
+  useEffect(() => {
+    setNotifPermission(getNotificationPermission());
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -180,11 +187,6 @@ export default function SettingsPage() {
                 title: "Online status",
                 description: "Let friends see when you are currently online.",
               },
-              {
-                key: "messagePreview" as const,
-                title: "Message previews",
-                description: "Show message text in notifications. Turn this off for a more private lock screen.",
-              },
             ].map((item) => (
               <div key={item.key} className="flex items-center justify-between gap-4 py-3.5">
                 <div className="min-w-0">
@@ -237,6 +239,62 @@ export default function SettingsPage() {
               </select>
             </div>
 
+            <div className="py-3.5">
+              <div className="mb-2 flex items-center gap-2">
+                <Bell size={14} className="text-muted" />
+                <p className="text-sm font-medium">Desktop notifications</p>
+              </div>
+              <p className="mb-2 text-xs leading-5 text-muted">
+                Shows a system notification when a message arrives while this tab isn&apos;t focused. Only
+                works while Sakhya is open in a tab somewhere — this isn&apos;t push notifications for a
+                closed browser.
+              </p>
+              {notifPermission === "unsupported" ? (
+                <p className="text-xs text-muted">Not supported in this browser.</p>
+              ) : notifPermission === "granted" ? (
+                <p className="text-xs text-success">Enabled.</p>
+              ) : notifPermission === "denied" ? (
+                <p className="text-xs text-danger">
+                  Blocked in your browser settings. Enable notifications for this site in your browser to use this.
+                </p>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={async () => setNotifPermission(await requestNotificationPermission())}
+                >
+                  Enable desktop notifications
+                </Button>
+              )}
+            </div>
+
+            <div className="py-3.5">
+              <div className="mb-2">
+                <p className="text-sm font-medium">Notification content</p>
+                <p className="mt-0.5 text-xs leading-5 text-muted">
+                  How much to show in notifications for new messages. &quot;Full message&quot; only applies
+                  to non-encrypted conversations — for end-to-end encrypted chats, the server never has
+                  your message text to put in a notification regardless of this setting.
+                </p>
+              </div>
+              <select
+                value={privacy.notificationContentLevel}
+                disabled={privacySaving}
+                onChange={(e) =>
+                  updatePrivacy(
+                    "notificationContentLevel",
+                    e.target.value as PrivacySettings["notificationContentLevel"]
+                  )
+                }
+                className="h-10 w-full rounded-lg border border-border bg-background px-3 text-sm outline-none focus:ring-2 focus:ring-accent/30"
+              >
+                <option value="full">Full message</option>
+                <option value="sender">Sender name only</option>
+                <option value="generic">Generic (&quot;New message&quot;)</option>
+                <option value="hidden">Completely hidden</option>
+              </select>
+            </div>
+
             <div className="flex items-center justify-between gap-3 pt-3.5 text-xs">
               <span className="text-muted">
                 {privacySaving ? "Saving privacy settings…" : privacySaved ? "Privacy settings saved." : "Privacy settings are synced to your account."}
@@ -252,6 +310,18 @@ export default function SettingsPage() {
           </div>
         )}
       </section>
+
+      {/* Starred messages */}
+      <Link
+        href="/starred"
+        className="mb-6 flex items-center justify-between rounded-xl border border-border bg-surface p-5 hover:bg-surface-hover sm:p-6"
+      >
+        <div className="flex items-center gap-2">
+          <Star size={16} className="text-muted" />
+          <span className="font-medium">Starred messages</span>
+        </div>
+        <ChevronRight size={16} className="text-muted" />
+      </Link>
 
       {/* Chat Lock */}
       <ChatLockSettings />

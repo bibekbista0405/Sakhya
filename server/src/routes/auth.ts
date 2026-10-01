@@ -5,7 +5,7 @@ import { db } from "../db";
 import { signToken, requireAuth, AuthedRequest, describeDevice, clientIp } from "../middleware/auth";
 import { UserRow } from "../types";
 import {
-  toPublicUser,
+  toPrivateUser,
   isValidEmail,
   isValidUsername,
   sanitizeString,
@@ -94,7 +94,7 @@ router.post("/register", registerLimiter, (req, res: Response) => {
   const token = signToken({ userId: user.id, username: user.username });
   createSession(user.id, token, req as AuthedRequest);
 
-  res.status(201).json({ user: toPublicUser(user), token });
+  res.status(201).json({ user: toPrivateUser(user), token });
 });
 
 router.post("/login", loginLimiter, (req, res: Response) => {
@@ -120,7 +120,7 @@ router.post("/login", loginLimiter, (req, res: Response) => {
   const token = signToken({ userId: user.id, username: user.username });
   createSession(user.id, token, req as AuthedRequest);
 
-  res.json({ user: toPublicUser(user), token });
+  res.json({ user: toPrivateUser(user), token });
 });
 
 router.post("/logout", requireAuth, (req: AuthedRequest, res: Response) => {
@@ -186,7 +186,7 @@ router.get("/me", requireAuth, (req: AuthedRequest, res: Response) => {
     res.status(404).json({ error: "User not found" });
     return;
   }
-  res.json({ user: toPublicUser(user) });
+  res.json({ user: toPrivateUser(user) });
 });
 
 export default router;

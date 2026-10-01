@@ -28,14 +28,19 @@ export interface UserRow {
 export interface PublicUser {
   id: string;
   username: string;
-  email: string;
   avatar: string;
   bio: string;
   firstName: string;
   lastName: string;
+  createdAt: string;
+}
+
+// Private/self representation. Never use this for another user's profile,
+// search results, friends, calls, or socket payloads.
+export interface PrivateUser extends PublicUser {
+  email: string;
   dateOfBirth: string;
   gender: string;
-  createdAt: string;
 }
 
 export interface BlockedUserRow {

@@ -193,6 +193,17 @@ export function ensureDeviceRegistered(userId?: string): Promise<void> {
 
 /** Tops up the one-time-key pool if the server reports it's running low. */
 export async function maybeTopUpOneTimeKeys(): Promise<void> {
+  // BUG FOUND ON RE-AUDIT: this mutated the shared Olm account (generate_one_time_keys,
+  // mark_keys_as_published) and persisted it without withCryptoLock, while
+  // encryptForPeer/decryptFromPeer do the same under the lock. Running
+  // concurrently with either could lose an update to the persisted account
+  // pickle (e.g. a one-time key encryptForPeer just consumed reappearing as
+  // "unconsumed" after this function's persistAccount overwrites it with a
+  // stale snapshot) — a real forward-secrecy risk, not just a data race.
+  return withCryptoLock(() => maybeTopUpOneTimeKeysLocked());
+}
+
+async function maybeTopUpOneTimeKeysLocked(): Promise<void> {
   await ensureDeviceRegistered();
   const deviceId = await idbGet<string>(DEVICE_ID_KEY);
   if (!deviceId) return;
@@ -293,8 +304,8 @@ async function encryptForPeerLocked(peerUserId: string, plaintext: string): Prom
       oneTimeKey: { keyId: string; publicKey: string } | null;
       fallbackKey: { keyId: string; publicKey: string; signature: string } | null;
     }[];
-  }>(`/devices/bundle/${peerUserId}`);
-  const bundle = bundleRes.devices.find((d) => d.deviceId === identity.deviceId) ?? bundleRes.devices[0];
+  }>(`/devices/bundle/${peerUserId}?deviceId=${encodeURIComponent(identity.deviceId)}`);
+  const bundle = bundleRes.devices[0];
   if (!bundle) {
     throw new Error("This contact hasn't set up encryption on any device yet.");
   }
@@ -396,6 +407,28 @@ async function requireOwnDeviceId(): Promise<string> {
 export async function isDeviceRegistered(): Promise<boolean> {
   const id = await idbGet<string>(DEVICE_ID_KEY);
   return !!id;
+}
+
+/**
+ * Clears this tab's in-memory notion of "which account's crypto session is
+ * active" — the in-memory Olm account handle, the device-registration
+ * memoization, and the IndexedDB scope pointer. Does NOT delete anything
+ * from IndexedDB (that's forgetDeviceIdentity(), a separate, destructive
+ * action); the point here is just to stop a logged-out session from
+ * lingering in memory with the previous user's scope still active.
+ *
+ * BUG FOUND ON RE-AUDIT: nothing called this on logout. setIdbUserScope only
+ * ever got updated the NEXT time ensureDeviceRegistered ran with a new
+ * userId, meaning between logout and the next login this module's notion of
+ * "current user" stayed pointed at whoever just logged out. Not an active
+ * security hole (the auth token is already cleared by then, so any stray
+ * authenticated call would just fail), but a real correctness gap in a
+ * feature whose entire purpose is per-account isolation.
+ */
+export function clearActiveCryptoSession(): void {
+  cachedAccount = null;
+  deviceRegistrationPromise = null;
+  setIdbUserScope(null);
 }
 
 /** Returns this device's own public identity keys, for display in the security verification UI. */

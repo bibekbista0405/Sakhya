@@ -4,7 +4,8 @@ import { createContext, useContext, useEffect, useState, ReactNode, useCallback 
 import { useRouter } from "next/navigation";
 import { api, setToken, clearToken, getStoredToken } from "@/lib/api";
 import { User } from "@/types";
-import { ensureDeviceRegistered } from "@/lib/crypto";
+import { ensureDeviceRegistered, maybeTopUpOneTimeKeys, clearActiveCryptoSession } from "@/lib/crypto";
+import { closeAllBrowserNotifications } from "@/lib/browserNotifications";
 
 interface RegisterPayload {
   firstName: string;
@@ -92,6 +93,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch {
       // ignore network errors on logout
     }
+    closeAllBrowserNotifications();
+    clearActiveCryptoSession();
     clearToken();
     setTokenState(null);
     setUser(null);
@@ -99,6 +102,29 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [router]);
 
   const updateUser = useCallback((u: User) => setUser(u), []);
+
+  // BUG FOUND ON RE-AUDIT: maybeTopUpOneTimeKeys existed in lib/crypto.ts
+  // but was never actually called anywhere, meaning a device's one-time
+  // prekey pool would only ever shrink (each consumed when a peer starts a
+  // new session with it) and never get replenished — new incoming sessions
+  // would eventually have to fall back to the signed fallback key
+  // indefinitely, weakening forward secrecy for those sessions over time.
+  // Runs once shortly after login (offset from device registration so they
+  // don't contend for the crypto lock at the same instant) and periodically
+  // thereafter while the user is signed in.
+  useEffect(() => {
+    if (!user) return;
+    const initial = setTimeout(() => {
+      maybeTopUpOneTimeKeys().catch((err) => console.error("One-time key top-up failed:", err));
+    }, 5_000);
+    const interval = setInterval(() => {
+      maybeTopUpOneTimeKeys().catch((err) => console.error("One-time key top-up failed:", err));
+    }, 15 * 60 * 1000);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(interval);
+    };
+  }, [user]);
 
   return (
     <AuthContext.Provider value={{ user, token, loading, login, register, logout, updateUser }}>

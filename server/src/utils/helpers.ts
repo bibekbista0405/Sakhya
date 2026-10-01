@@ -1,19 +1,25 @@
 import { db } from "../db";
 import { v4 as uuidv4 } from "uuid";
-import { PublicUser, UserRow, NotificationRow } from "../types";
+import { PublicUser, PrivateUser, UserRow, NotificationRow } from "../types";
 
 export function toPublicUser(row: UserRow): PublicUser {
   return {
     id: row.id,
     username: row.username,
-    email: row.email,
     avatar: row.avatar,
     bio: row.bio,
     firstName: row.firstName,
     lastName: row.lastName,
+    createdAt: row.createdAt,
+  };
+}
+
+export function toPrivateUser(row: UserRow): PrivateUser {
+  return {
+    ...toPublicUser(row),
+    email: row.email,
     dateOfBirth: row.dateOfBirth,
     gender: row.gender,
-    createdAt: row.createdAt,
   };
 }
 

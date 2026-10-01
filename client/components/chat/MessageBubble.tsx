@@ -1,7 +1,7 @@
 "use client";
 
 import { memo, useMemo, useState, useEffect } from "react";
-import { Check, CheckCheck, Copy, Edit3, MoreHorizontal, Reply, Trash2, Lock, ShieldAlert, FileText, Download, Loader2, Timer } from "lucide-react";
+import { Check, CheckCheck, Copy, Edit3, MoreHorizontal, Reply, Trash2, Lock, ShieldAlert, FileText, Download, Loader2, Timer, Star } from "lucide-react";
 import { Message } from "@/types";
 import { cn, formatTime } from "@/lib/utils";
 import { parseAttachmentMetadata, downloadAndDecryptAttachment, consumeViewOnceAttachment, toConsumedMetadata, AttachmentMetadata } from "@/lib/attachments";
@@ -187,8 +187,13 @@ interface MessageBubbleProps {
   isOwn: boolean;
   onReply: (message: Message) => void;
   onEdit: (message: Message) => void;
+  /** "Delete for everyone" — sender-only, clears content for both participants. */
   onDelete: (message: Message) => void;
+  /** "Delete for me" — available to either participant, hides only from this viewer. */
+  onDeleteForMe: (message: Message) => void;
   onReact: (message: Message, emoji: string) => void;
+  onToggleStar: (message: Message) => void;
+  onJumpToReply?: (messageId: string) => void;
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -197,7 +202,10 @@ export const MessageBubble = memo(function MessageBubble({
   onReply,
   onEdit,
   onDelete,
+  onDeleteForMe,
   onReact,
+  onToggleStar,
+  onJumpToReply,
 }: MessageBubbleProps) {
   const [open, setOpen] = useState(false);
   const deleted = !!message.deletedAt;
@@ -225,10 +233,17 @@ export const MessageBubble = memo(function MessageBubble({
           )}
         >
           {message.replyToId && !deleted && (
-            <div className={cn("mb-2 rounded-xl border-l-2 px-2 py-1 text-xs", isOwn ? "border-white/60 bg-white/10 text-white/80" : "border-accent bg-accent-soft text-muted")}>
+            <button
+              type="button"
+              onClick={() => onJumpToReply?.(message.replyToId!)}
+              className={cn(
+                "mb-2 block w-full rounded-xl border-l-2 px-2 py-1 text-left text-xs",
+                isOwn ? "border-white/60 bg-white/10 text-white/80" : "border-accent bg-accent-soft text-muted"
+              )}
+            >
               <span className="font-medium">Reply</span>
               <p className="mt-0.5 truncate">{message.replyToContent || "Original message"}</p>
-            </div>
+            </button>
           )}
           <p className={cn("whitespace-pre-wrap break-words", deleted && "italic text-muted", attachment && "hidden")}>
             {deleted
@@ -247,6 +262,9 @@ export const MessageBubble = memo(function MessageBubble({
             )}
             {!deleted && message.expiresAt && (
               <span title="This message will disappear"><Timer size={11} /></span>
+            )}
+            {!deleted && message.isStarred && (
+              <span title="Starred"><Star size={11} className="fill-current" /></span>
             )}
             <span>{formatTime(message.createdAt)}</span>
             {message.editedAt && !deleted && <span>edited</span>}
@@ -281,18 +299,45 @@ export const MessageBubble = memo(function MessageBubble({
           {!deleted && <button onClick={copyMessage} className="rounded-full p-2 text-muted hover:bg-surface-hover hover:text-foreground" aria-label="Copy"><Copy size={15} /></button>}
           {!deleted && <button onClick={() => onReact(message, "👍")} className="rounded-full p-2 text-muted hover:bg-surface-hover hover:text-foreground" aria-label="Like"><span className="text-sm">👍</span></button>}
           {isOwn && !deleted && <button onClick={() => onEdit(message)} className="rounded-full p-2 text-muted hover:bg-surface-hover hover:text-foreground" aria-label="Edit"><Edit3 size={15} /></button>}
-          {isOwn && !deleted && <button onClick={() => onDelete(message)} className="rounded-full p-2 text-muted hover:bg-danger-soft hover:text-danger" aria-label="Delete"><Trash2 size={15} /></button>}
           <button onClick={() => setOpen((v) => !v)} className="rounded-full p-2 text-muted hover:bg-surface-hover hover:text-foreground" aria-label="More actions"><MoreHorizontal size={15} /></button>
         </div>
 
-        {open && !deleted && (
-          <div className={cn("absolute top-10 z-30 w-48 rounded-xl border border-border bg-surface p-2 shadow-lg", isOwn ? "right-0" : "left-0")}>
-            <p className="px-2 pb-1 text-[11px] font-medium text-muted">React</p>
-            <div className="grid grid-cols-4 gap-1">
-              {REACTIONS.map((emoji) => (
-                <button key={emoji} onClick={() => { onReact(message, emoji); setOpen(false); }} className="rounded-lg p-2 text-lg hover:bg-surface-hover" aria-label={`React with ${emoji}`}>{emoji}</button>
-              ))}
-            </div>
+        {open && (
+          <div className={cn("absolute top-10 z-30 w-52 rounded-xl border border-border bg-surface p-2 shadow-lg", isOwn ? "right-0" : "left-0")}>
+            {!deleted && (
+              <>
+                <p className="px-2 pb-1 text-[11px] font-medium text-muted">React</p>
+                <div className="mb-2 grid grid-cols-4 gap-1">
+                  {REACTIONS.map((emoji) => (
+                    <button key={emoji} onClick={() => { onReact(message, emoji); setOpen(false); }} className="rounded-lg p-2 text-lg hover:bg-surface-hover" aria-label={`React with ${emoji}`}>{emoji}</button>
+                  ))}
+                </div>
+                <div className="my-1 border-t border-border" />
+              </>
+            )}
+            <button
+              onClick={() => { onToggleStar(message); setOpen(false); }}
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm hover:bg-surface-hover"
+            >
+              <Star size={15} className={message.isStarred ? "fill-current text-accent" : ""} />
+              {message.isStarred ? "Unstar" : "Star"}
+            </button>
+            <button
+              onClick={() => { onDeleteForMe(message); setOpen(false); }}
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm hover:bg-surface-hover"
+            >
+              <Trash2 size={15} />
+              Delete for me
+            </button>
+            {isOwn && !deleted && (
+              <button
+                onClick={() => { onDelete(message); setOpen(false); }}
+                className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-sm text-danger hover:bg-danger-soft"
+              >
+                <Trash2 size={15} />
+                Delete for everyone
+              </button>
+            )}
           </div>
         )}
       </div>

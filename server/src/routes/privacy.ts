@@ -5,6 +5,9 @@ import { requireAuth, AuthedRequest } from "../middleware/auth";
 const router = Router();
 
 type Visibility = "everyone" | "friends" | "nobody";
+type NotificationContentLevel = "full" | "sender" | "generic" | "hidden";
+
+const VALID_NOTIFICATION_LEVELS: NotificationContentLevel[] = ["full", "sender", "generic", "hidden"];
 
 function ensureSettings(userId: string) {
   db.prepare(
@@ -17,14 +20,14 @@ function ensureSettings(userId: string) {
 function getSettings(userId: string) {
   ensureSettings(userId);
   const row = db.prepare(
-    `SELECT readReceipts, typingIndicators, onlineStatus, lastSeenVisibility, messagePreview
+    `SELECT readReceipts, typingIndicators, onlineStatus, lastSeenVisibility, notificationContentLevel
      FROM privacy_settings WHERE userId = ?`
   ).get(userId) as {
     readReceipts: number;
     typingIndicators: number;
     onlineStatus: number;
     lastSeenVisibility: Visibility;
-    messagePreview: number;
+    notificationContentLevel: NotificationContentLevel;
   };
 
   return {
@@ -32,7 +35,7 @@ function getSettings(userId: string) {
     typingIndicators: Boolean(row.typingIndicators),
     onlineStatus: Boolean(row.onlineStatus),
     lastSeenVisibility: row.lastSeenVisibility,
-    messagePreview: Boolean(row.messagePreview),
+    notificationContentLevel: row.notificationContentLevel,
   };
 }
 
@@ -52,10 +55,11 @@ router.put("/", requireAuth, (req: AuthedRequest, res: Response) => {
       : current.typingIndicators;
   const onlineStatus =
     typeof req.body?.onlineStatus === "boolean" ? req.body.onlineStatus : current.onlineStatus;
-  const messagePreview =
-    typeof req.body?.messagePreview === "boolean"
-      ? req.body.messagePreview
-      : current.messagePreview;
+
+  const requestedLevel = req.body?.notificationContentLevel;
+  const notificationContentLevel: NotificationContentLevel = VALID_NOTIFICATION_LEVELS.includes(requestedLevel)
+    ? requestedLevel
+    : current.notificationContentLevel;
 
   const requestedVisibility = req.body?.lastSeenVisibility;
   const lastSeenVisibility: Visibility =
@@ -68,14 +72,14 @@ router.put("/", requireAuth, (req: AuthedRequest, res: Response) => {
   db.prepare(
     `UPDATE privacy_settings
      SET readReceipts = ?, typingIndicators = ?, onlineStatus = ?,
-         lastSeenVisibility = ?, messagePreview = ?, updatedAt = datetime('now')
+         lastSeenVisibility = ?, notificationContentLevel = ?, updatedAt = datetime('now')
      WHERE userId = ?`
   ).run(
     readReceipts ? 1 : 0,
     typingIndicators ? 1 : 0,
     onlineStatus ? 1 : 0,
     lastSeenVisibility,
-    messagePreview ? 1 : 0,
+    notificationContentLevel,
     userId
   );
 

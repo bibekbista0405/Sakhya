@@ -1,9 +1,10 @@
 import { Router, Response } from "express";
-import { db } from "../db";
+import { db, isOnlineStatusVisible, getLastSeen, createReport } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { UserRow } from "../types";
-import { toPublicUser, sanitizeString } from "../utils/helpers";
+import { toPublicUser, toPrivateUser, sanitizeString } from "../utils/helpers";
 import { isUserOnline } from "../socket/registry";
+import { sensitiveSettingsLimiter } from "../middleware/rateLimit";
 
 const router = Router();
 
@@ -23,10 +24,11 @@ router.get("/search", requireAuth, (req: AuthedRequest, res: Response) => {
     )
     .all(`%${q}%`, req.user!.userId, req.user!.userId, req.user!.userId) as UserRow[];
 
-  res.json({ users: rows.map((r) => ({ ...toPublicUser(r), online: isUserOnline(r.id) })) });
+  res.json({ users: rows.map((r) => ({ ...toPublicUser(r), online: isOnlineStatusVisible(r.id) && isUserOnline(r.id) })) });
 });
 
 router.get("/:id", requireAuth, (req: AuthedRequest, res: Response) => {
+  const viewerId = req.user!.userId;
   const user = db.prepare(`SELECT * FROM users WHERE id = ?`).get(req.params.id) as
     | UserRow
     | undefined;
@@ -34,7 +36,56 @@ router.get("/:id", requireAuth, (req: AuthedRequest, res: Response) => {
     res.status(404).json({ error: "User not found" });
     return;
   }
-  res.json({ user: { ...toPublicUser(user), online: isUserOnline(user.id) } });
+
+  const online = isOnlineStatusVisible(user.id) && isUserOnline(user.id);
+
+  const privacyRow = db
+    .prepare(`SELECT lastSeenVisibility FROM privacy_settings WHERE userId = ?`)
+    .get(user.id) as { lastSeenVisibility: "everyone" | "friends" | "nobody" } | undefined;
+  const visibility = privacyRow?.lastSeenVisibility ?? "friends";
+  const friends =
+    viewerId === user.id ||
+    !!db
+      .prepare(`SELECT 1 FROM friends WHERE userId = ? AND friendId = ?`)
+      .get(viewerId, user.id);
+  const lastSeenAllowed =
+    viewerId === user.id || visibility === "everyone" || (visibility === "friends" && friends);
+  const lastSeenAt = !online && lastSeenAllowed ? getLastSeen(user.id) : null;
+
+  const serialized = viewerId === user.id ? toPrivateUser(user) : toPublicUser(user);
+  res.json({ user: { ...serialized, online, lastSeenAt } });
+});
+
+const VALID_REPORT_REASONS = ["spam", "harassment", "impersonation", "inappropriate_content", "other"];
+
+/**
+ * Records a report for manual review. There is no admin/moderation UI in
+ * this codebase yet — this stores the report and nothing more. Doesn't
+ * require friendship (you should be able to report a stranger's account),
+ * but is rate-limited since it's an easy vector for report-spam.
+ */
+router.post("/:id/report", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequest, res: Response) => {
+  const reporterId = req.user!.userId;
+  const reportedUserId = req.params.id;
+  const reason = typeof req.body?.reason === "string" ? req.body.reason : "";
+  const messageId = typeof req.body?.messageId === "string" ? req.body.messageId : null;
+
+  if (reportedUserId === reporterId) {
+    res.status(400).json({ error: "You cannot report yourself" });
+    return;
+  }
+  if (!VALID_REPORT_REASONS.includes(reason)) {
+    res.status(400).json({ error: "Invalid report reason" });
+    return;
+  }
+  const target = db.prepare(`SELECT id FROM users WHERE id = ?`).get(reportedUserId);
+  if (!target) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  createReport(reporterId, reportedUserId, reason, messageId);
+  res.status(201).json({ success: true });
 });
 
 export default router;

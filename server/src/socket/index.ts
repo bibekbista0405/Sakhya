@@ -3,7 +3,20 @@ import path from "path";
 import { Server, Socket } from "socket.io";
 import jwt from "jsonwebtoken";
 import { v4 as uuidv4 } from "uuid";
-import { db, purgeExpiredMessages, getDisappearingSeconds, setDisappearingSeconds, isConversationLocked } from "../db";
+import {
+  db,
+  purgeExpiredMessages,
+  getDisappearingSeconds,
+  setDisappearingSeconds,
+  effectiveNotificationLevel,
+  deleteMessageForUser,
+  starMessage,
+  unstarMessage,
+  updateLastSeen,
+  isOnlineStatusVisible,
+  muteConversation,
+  unmuteConversation,
+} from "../db";
 import { JWT_SECRET } from "../middleware/auth";
 import { ATTACHMENTS_DIR } from "../routes/attachments";
 import {
@@ -34,7 +47,10 @@ const ALLOWED_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "😡", "�
 // per user to blunt message-spam abuse; it intentionally lives in memory since
 // it only needs to survive for the lifetime of a single process/connection.
 const MESSAGE_RATE_WINDOW_MS = 10_000;
-const MESSAGE_RATE_MAX = 20;
+// Relaxed in non-production so local testing (rapid manual sends, or a test
+// script firing many messages back-to-back) doesn't trip this — same
+// reasoning as the environment-aware HTTP rate limits in middleware/rateLimit.ts.
+const MESSAGE_RATE_MAX = process.env.NODE_ENV === "production" ? 20 : 20 * 20;
 const messageRateLog = new Map<string, number[]>();
 
 function isRateLimited(userId: string): boolean {
@@ -134,7 +150,9 @@ export function initSocket(io: Server): void {
     if (!onlineUsers.has(userId)) onlineUsers.set(userId, new Set());
     onlineUsers.get(userId)!.add(socket.id);
     broadcastPresence(userId, true);
-    socket.emit("online_users", { userIds: Array.from(onlineUsers.keys()) });
+    socket.emit("online_users", {
+      userIds: Array.from(onlineUsers.keys()).filter((id) => isOnlineStatusVisible(id)),
+    });
 
     socket.on(
       "send_message",
@@ -146,8 +164,10 @@ export function initSocket(io: Server): void {
         olmMessageType?: 0 | 1;
         senderDeviceId?: string;
         attachmentId?: string;
+        clientMessageId?: string;
       }) => {
         const receiverId = data?.receiverId;
+        const clientMessageId = typeof data?.clientMessageId === "string" ? data.clientMessageId.slice(0, 100) : null;
         const replyToId = typeof data?.replyToId === "string" ? data.replyToId : null;
         const attachmentId = typeof data?.attachmentId === "string" ? data.attachmentId : null;
 
@@ -163,16 +183,26 @@ export function initSocket(io: Server): void {
 
         if (!receiverId || (!isEncrypted && !legacyContent)) return;
         if (isRateLimited(userId)) {
-          socket.emit("error_message", { error: "You're sending messages too quickly. Please slow down." });
+          socket.emit("error_message", { error: "You're sending messages too quickly. Please slow down.", clientMessageId, receiverId });
           return;
         }
         if (!areFriends(userId, receiverId)) {
-          socket.emit("error_message", { error: "You can only message friends" });
+          socket.emit("error_message", { error: "You can only message friends", clientMessageId, receiverId });
           return;
         }
         if (isBlocked(userId, receiverId)) {
-          socket.emit("error_message", { error: "You cannot message this user" });
+          socket.emit("error_message", { error: "You cannot message this user", clientMessageId, receiverId });
           return;
+        }
+
+        if (isEncrypted) {
+          const senderDevice = db
+            .prepare(`SELECT id FROM devices WHERE id = ? AND userId = ? AND revokedAt IS NULL`)
+            .get(senderDeviceId, userId);
+          if (!senderDevice) {
+            socket.emit("error_message", { error: "Invalid or revoked encryption device", clientMessageId, receiverId });
+            return;
+          }
         }
 
         // If this message references an attachment, it must be one this user
@@ -184,7 +214,7 @@ export function initSocket(io: Server): void {
             .prepare(`SELECT * FROM attachments WHERE id = ? AND senderId = ? AND receiverId = ? AND messageId IS NULL`)
             .get(attachmentId, userId, receiverId) as AttachmentRow | undefined;
           if (!attachment) {
-            socket.emit("error_message", { error: "Invalid or already-used attachment" });
+            socket.emit("error_message", { error: "Invalid or already-used attachment", clientMessageId, receiverId });
             return;
           }
         }
@@ -194,7 +224,7 @@ export function initSocket(io: Server): void {
             | { senderId: string; receiverId: string }
             | undefined;
           if (!reply || !((reply.senderId === userId && reply.receiverId === receiverId) || (reply.senderId === receiverId && reply.receiverId === userId))) {
-            socket.emit("error_message", { error: "Invalid reply target" });
+            socket.emit("error_message", { error: "Invalid reply target", clientMessageId, receiverId });
             return;
           }
         }
@@ -236,23 +266,39 @@ export function initSocket(io: Server): void {
 
         const message = getMessage(id);
         if (!message) return;
-        socket.emit("receive_message", message);
+        socket.emit("receive_message", clientMessageId ? { ...message, clientMessageId } : message);
         emitToUser(receiverId, "receive_message", message);
 
         const sender = db.prepare(`SELECT * FROM users WHERE id = ?`).get(userId) as UserRow;
-        // Never put plaintext content in a notification for an encrypted
-        // message — the server cannot read it, and even if it could, doing
-        // so would defeat the point of E2EE for anyone who can see notifications.
-        // A conversation the RECIPIENT has locked also hides the sender's
-        // name, not just the content — that's the point of locking it.
-        const recipientLockedThisChat = isConversationLocked(receiverId, userId);
-        const notifText = recipientLockedThisChat
-          ? "New message"
-          : isEncrypted
-          ? `${sender.username} sent you a message`
-          : `${sender.username}: ${legacyContent.slice(0, 80)}`;
-        const notif = createNotification(receiverId, "message", notifText, id);
-        emitToUser(receiverId, "notification", notif);
+        // Phase 7: the recipient's notification-content preference, floored
+        // to "generic" if they've locked this specific conversation (locking
+        // it implies not wanting to see who it's from at a glance, even if
+        // their global notification setting is more permissive).
+        const level = effectiveNotificationLevel(receiverId, userId);
+        if (level !== "hidden") {
+          let notifText: string;
+          if (level === "generic") {
+            notifText = "New message";
+          } else if (level === "sender") {
+            notifText = `${sender.username} sent you a message`;
+          } else {
+            // level === "full": only actually achievable for legacy plaintext
+            // messages — the server has no plaintext for an encrypted message
+            // regardless of this setting, so it degrades to "sender" text.
+            // The client's browser-notification layer can do better here: it
+            // already has the decrypted plaintext and can use it directly
+            // instead of this server-stored fallback (see lib/notifications.ts).
+            notifText = isEncrypted
+              ? `${sender.username} sent you a message`
+              : `${sender.username}: ${legacyContent.slice(0, 80)}`;
+          }
+          const notif = createNotification(receiverId, "message", notifText, id);
+          emitToUser(receiverId, "notification", {
+            ...notif,
+            upgradableToFull: level === "full" && isEncrypted,
+            senderId: userId,
+          });
+        }
       }
     );
 
@@ -300,6 +346,56 @@ export function initSocket(io: Server): void {
       ).run(messageId);
       const message = getMessage(messageId);
       if (message) sendMessageToParticipants(message);
+    });
+
+    /**
+     * "Delete for me" — a purely per-viewer hide. Either participant can hide
+     * any message from their own view (not just the sender, unlike "delete
+     * for everyone" above): it never touches the shared message row, so the
+     * other participant's view is completely unaffected. Only echoed back to
+     * the requester, never to the other participant.
+     */
+    socket.on("delete_message_for_me", (data: { messageId: string }) => {
+      const messageId = data?.messageId;
+      if (!messageId) return;
+      const existing = db.prepare(`SELECT senderId, receiverId FROM messages WHERE id = ?`).get(messageId) as
+        | { senderId: string; receiverId: string }
+        | undefined;
+      if (!existing || (existing.senderId !== userId && existing.receiverId !== userId)) return;
+      deleteMessageForUser(userId, messageId);
+      socket.emit("message_hidden", { messageId });
+    });
+
+    socket.on("star_message", (data: { messageId: string }) => {
+      const messageId = data?.messageId;
+      if (!messageId) return;
+      const existing = db.prepare(`SELECT senderId, receiverId FROM messages WHERE id = ?`).get(messageId) as
+        | { senderId: string; receiverId: string }
+        | undefined;
+      if (!existing || (existing.senderId !== userId && existing.receiverId !== userId)) return;
+      starMessage(userId, messageId);
+      socket.emit("message_starred", { messageId, starred: true });
+    });
+
+    socket.on("unstar_message", (data: { messageId: string }) => {
+      const messageId = data?.messageId;
+      if (!messageId) return;
+      unstarMessage(userId, messageId);
+      socket.emit("message_starred", { messageId, starred: false });
+    });
+
+    socket.on("mute_conversation", (data: { friendId: string }) => {
+      const friendId = data?.friendId;
+      if (!friendId || !areFriends(userId, friendId)) return;
+      muteConversation(userId, friendId);
+      socket.emit("conversation_muted", { friendId, muted: true });
+    });
+
+    socket.on("unmute_conversation", (data: { friendId: string }) => {
+      const friendId = data?.friendId;
+      if (!friendId) return;
+      unmuteConversation(userId, friendId);
+      socket.emit("conversation_muted", { friendId, muted: false });
     });
 
     const ALLOWED_DISAPPEARING_SECONDS = [0, 30, 60, 300, 3600, 86400, 604800];
@@ -465,6 +561,7 @@ export function initSocket(io: Server): void {
         sockets.delete(socket.id);
         if (sockets.size === 0) {
           onlineUsers.delete(userId);
+          updateLastSeen(userId);
           broadcastPresence(userId, false);
           for (const [callId, call] of activeCalls.entries()) {
             if (call.callerId === userId || call.receiverId === userId) {
@@ -497,6 +594,11 @@ setInterval(() => {
 }, 5_000);
 
 function broadcastPresence(userId: string, online: boolean): void {
+  // Respects the same onlineStatus privacy setting as the REST endpoints —
+  // otherwise a user who's turned their online status off would still leak
+  // real-time presence to friends over the socket. See db/index.ts's
+  // isOnlineStatusVisible for the bug this closes.
+  if (!isOnlineStatusVisible(userId)) return;
   const friends = db.prepare(`SELECT friendId FROM friends WHERE userId = ?`).all(userId) as { friendId: string }[];
   for (const f of friends) emitToUser(f.friendId, online ? "user_online" : "user_offline", { userId });
 }

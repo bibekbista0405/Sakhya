@@ -9,10 +9,9 @@ import { getCachedPlaintext, setCachedPlaintext } from "./messageStore";
  * contains ciphertext), returns a copy with `content` set to the best
  * plaintext we can produce, plus flags describing how we got there.
  *
- * `pendingOwnPlaintext`: for the sender's own just-sent message, the plaintext
- * they typed (known locally, never needs decrypting — see the note in
- * messageStore.ts on why Olm ciphertext can't generally be re-decrypted by
- * its own sender).
+ * `pendingOwnPlaintext`: plaintext correlated to this exact outbound message
+ * by the sender's ephemeral clientMessageId. It is known locally and never
+ * needs to be decrypted from the sender's own Olm ciphertext.
  */
 export async function resolveMessagePlaintext(
   message: Message,

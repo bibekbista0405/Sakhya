@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
+import { MessageRow } from "../types";
 
 dotenv.config();
 
@@ -317,6 +318,73 @@ export function initDb(): void {
       PRIMARY KEY (userId, friendId)
     );
   `);
+
+  // --- Phase 7: notification content privacy ---
+  // Replaces the old on/off `messagePreview` flag (which existed in the
+  // schema from before this transformation but was never actually enforced
+  // anywhere) with a 4-level setting. "full" is only achievable for legacy
+  // plaintext messages — the server never has plaintext for E2EE messages
+  // regardless of this setting, so "full" degrades to "sender" for those.
+  // See socket/index.ts's notificationTextFor() for the enforcement.
+  const privacyCols2 = (db.prepare(`PRAGMA table_info(privacy_settings)`).all() as { name: string }[]).map(
+    (c) => c.name
+  );
+  if (!privacyCols2.includes("notificationContentLevel")) {
+    db.exec(`ALTER TABLE privacy_settings ADD COLUMN notificationContentLevel TEXT NOT NULL DEFAULT 'sender'`);
+    // Best-effort migration from the old unused boolean so existing rows get
+    // a sensible starting value rather than silently jumping to the new default.
+    db.exec(`UPDATE privacy_settings SET notificationContentLevel = CASE WHEN messagePreview = 1 THEN 'full' ELSE 'sender' END`);
+  }
+
+  // --- Phase 8: messaging quality ---
+  // "Delete for me" is a per-viewer hide, distinct from the existing
+  // sender-only "delete for everyone" (which hard-clears content/ciphertext
+  // for both parties). Hiding a message for yourself must never affect what
+  // the other participant sees, and must survive across this user's other
+  // sessions/devices — hence a server-side table filtered at fetch time,
+  // not a device-local hide that would reappear on a fresh browser.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS deleted_for_user (
+      userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      messageId TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      deletedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (userId, messageId)
+    );
+    CREATE INDEX IF NOT EXISTS idx_deleted_for_user_message ON deleted_for_user(messageId);
+
+    CREATE TABLE IF NOT EXISTS starred_messages (
+      userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      messageId TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      starredAt TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (userId, messageId)
+    );
+    CREATE INDEX IF NOT EXISTS idx_starred_messages_user ON starred_messages(userId, starredAt);
+  `);
+
+  // --- Phase 9: Chat Info & Media ---
+  const userCols = (db.prepare(`PRAGMA table_info(users)`).all() as { name: string }[]).map((c) => c.name);
+  if (!userCols.includes("lastSeenAt")) {
+    db.exec(`ALTER TABLE users ADD COLUMN lastSeenAt TEXT`);
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS muted_conversations (
+      userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      friendId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      mutedAt TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (userId, friendId)
+    );
+
+    CREATE TABLE IF NOT EXISTS reports (
+      id TEXT PRIMARY KEY,
+      reporterId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reportedUserId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      reason TEXT NOT NULL,
+      messageId TEXT,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_reports_reported ON reports(reportedUserId);
+  `);
 }
 
 /**
@@ -456,6 +524,175 @@ export function getLockedFriendIds(userId: string): string[] {
   );
 }
 
+// --- Phase 8: delete-for-me and starred messages ---------------------------
+
+export function deleteMessageForUser(userId: string, messageId: string): void {
+  db.prepare(`INSERT OR IGNORE INTO deleted_for_user (userId, messageId) VALUES (?, ?)`).run(userId, messageId);
+}
+
+/** Used to filter a fetched message list down to what this user hasn't hidden for themselves. */
+export function getHiddenMessageIds(userId: string, messageIds: string[]): Set<string> {
+  if (messageIds.length === 0) return new Set();
+  const placeholders = messageIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT messageId FROM deleted_for_user WHERE userId = ? AND messageId IN (${placeholders})`)
+    .all(userId, ...messageIds) as { messageId: string }[];
+  return new Set(rows.map((r) => r.messageId));
+}
+
+export function starMessage(userId: string, messageId: string): void {
+  db.prepare(`INSERT OR IGNORE INTO starred_messages (userId, messageId) VALUES (?, ?)`).run(userId, messageId);
+}
+
+export function unstarMessage(userId: string, messageId: string): void {
+  db.prepare(`DELETE FROM starred_messages WHERE userId = ? AND messageId = ?`).run(userId, messageId);
+}
+
+export function getStarredMessageIds(userId: string, messageIds: string[]): Set<string> {
+  if (messageIds.length === 0) return new Set();
+  const placeholders = messageIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT messageId FROM starred_messages WHERE userId = ? AND messageId IN (${placeholders})`)
+    .all(userId, ...messageIds) as { messageId: string }[];
+  return new Set(rows.map((r) => r.messageId));
+}
+
+/**
+ * All of a user's starred messages, newest-starred-first, with the other
+ * participant's id so the client can route "jump to conversation." A
+ * starred message that was later hidden via "delete for me" by this same
+ * user is excluded — starring doesn't override your own delete-for-me.
+ */
+export function getStarredMessagesForUser(userId: string): (MessageRow & { starredAt: string })[] {
+  return db
+    .prepare(
+      `SELECT m.*, s.starredAt FROM starred_messages s
+       JOIN messages m ON m.id = s.messageId
+       WHERE s.userId = ?
+         AND (m.senderId = ? OR m.receiverId = ?)
+         AND NOT EXISTS (SELECT 1 FROM deleted_for_user d WHERE d.userId = ? AND d.messageId = m.id)
+       ORDER BY s.starredAt DESC`
+    )
+    .all(userId, userId, userId, userId) as (MessageRow & { starredAt: string })[];
+}
+
+// --- Phase 9: Chat Info & Media ---------------------------------------------
+
+export function updateLastSeen(userId: string): void {
+  db.prepare(`UPDATE users SET lastSeenAt = datetime('now') WHERE id = ?`).run(userId);
+}
+
+export function getLastSeen(userId: string): string | null {
+  const row = db.prepare(`SELECT lastSeenAt FROM users WHERE id = ?`).get(userId) as
+    | { lastSeenAt: string | null }
+    | undefined;
+  return row?.lastSeenAt ?? null;
+}
+
+export function muteConversation(userId: string, friendId: string): void {
+  db.prepare(`INSERT OR IGNORE INTO muted_conversations (userId, friendId) VALUES (?, ?)`).run(userId, friendId);
+}
+
+export function unmuteConversation(userId: string, friendId: string): void {
+  db.prepare(`DELETE FROM muted_conversations WHERE userId = ? AND friendId = ?`).run(userId, friendId);
+}
+
+export function isConversationMuted(userId: string, friendId: string): boolean {
+  return !!db.prepare(`SELECT 1 FROM muted_conversations WHERE userId = ? AND friendId = ?`).get(userId, friendId);
+}
+
+export function getMutedFriendIds(userId: string): string[] {
+  return (
+    db.prepare(`SELECT friendId FROM muted_conversations WHERE userId = ?`).all(userId) as { friendId: string }[]
+  ).map((r) => r.friendId);
+}
+
+export function createReport(reporterId: string, reportedUserId: string, reason: string, messageId: string | null): void {
+  db.prepare(
+    `INSERT INTO reports (id, reporterId, reportedUserId, reason, messageId) VALUES (?, ?, ?, ?, ?)`
+  ).run(cryptoRandomId(), reporterId, reportedUserId, reason, messageId);
+}
+
+function cryptoRandomId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * "Clear chat" / "delete conversation" are the same underlying operation
+ * here — bulk "delete for me" across every message in the conversation.
+ * This only ever affects the requesting user's own view; the other
+ * participant's history and ability to message is completely unaffected,
+ * consistent with the per-viewer "delete for me" semantics from Phase 8.
+ * Once nothing undeleted remains, the conversation naturally stops
+ * appearing in this user's chat list (see routes/messages.ts's
+ * /conversations query), which is what makes "clear chat" and "delete
+ * conversation" the same operation from this account's point of view.
+ */
+export function clearConversationForUser(userId: string, friendId: string): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO deleted_for_user (userId, messageId)
+     SELECT ?, id FROM messages WHERE (senderId = ? AND receiverId = ?) OR (senderId = ? AND receiverId = ?)`
+  ).run(userId, userId, friendId, friendId, userId);
+}
+
+/**
+ * BUG FOUND WHILE BUILDING PHASE 9: `privacy_settings.onlineStatus` has
+ * existed since before this transformation and is fully wired up in the
+ * Settings API (routes/privacy.ts), but nothing ever actually checked it —
+ * every route that exposes `online: isUserOnline(id)` did so unconditionally
+ * for every user, regardless of this setting. Turning "online status" off
+ * did nothing. This wraps the real connection-state check with the target
+ * user's own preference, and is now used everywhere online status is
+ * exposed to someone else (never applied to a user's OWN view of their own
+ * status, which is always accurate) — including the live socket presence
+ * broadcast in socket/index.ts, not just the REST endpoints, since a fix
+ * that only covered REST would still leak real-time presence over the socket.
+ */
+export function isOnlineStatusVisible(targetUserId: string): boolean {
+  const row = db.prepare(`SELECT onlineStatus FROM privacy_settings WHERE userId = ?`).get(targetUserId) as
+    | { onlineStatus: number }
+    | undefined;
+  return row?.onlineStatus !== 0; // default true if no settings row exists yet
+}
+
+// --- Phase 7: notification content privacy ---------------------------------
+
+export type NotificationContentLevel = "full" | "sender" | "generic" | "hidden";
+
+const LEVEL_RESTRICTIVENESS: Record<NotificationContentLevel, number> = {
+  full: 0,
+  sender: 1,
+  generic: 2,
+  hidden: 3,
+};
+
+export function getNotificationContentLevel(userId: string): NotificationContentLevel {
+  db.prepare(`INSERT INTO privacy_settings (userId) VALUES (?) ON CONFLICT(userId) DO NOTHING`).run(userId);
+  const row = db
+    .prepare(`SELECT notificationContentLevel FROM privacy_settings WHERE userId = ?`)
+    .get(userId) as { notificationContentLevel: NotificationContentLevel };
+  return row.notificationContentLevel;
+}
+
+/**
+ * The level actually applied to a specific incoming-message notification:
+ * the more restrictive of (a) the recipient's global preference and (b)
+ * "generic" if the recipient has this specific conversation locked — locking
+ * a chat should never reveal less than what locking already implies, even
+ * if someone's global notification setting is more permissive.
+ */
+export function effectiveNotificationLevel(recipientId: string, senderId: string): NotificationContentLevel {
+  // Muting is the strongest signal available — it always wins outright,
+  // regardless of the global setting or whether the chat happens to be locked.
+  if (isConversationMuted(recipientId, senderId)) return "hidden";
+  const global = getNotificationContentLevel(recipientId);
+  if (isConversationLocked(recipientId, senderId)) {
+    const floor: NotificationContentLevel = "generic";
+    return LEVEL_RESTRICTIVENESS[global] >= LEVEL_RESTRICTIVENESS[floor] ? global : floor;
+  }
+  return global;
+}
+
 /**
  * Deletes attachment rows (and returns their storage paths for the caller to
  * unlink from disk) that were never attached to a sent message within an
@@ -476,7 +713,28 @@ export function deleteAttachmentRow(id: string): void {
 
 // Periodically purge expired sessions so revoked/expired tokens can never be reused
 // even if a stray reference to them exists somewhere.
+//
+// BUG FOUND ON RE-AUDIT: this used to compare `expiresAt < datetime('now')`
+// directly. `expiresAt` is written as a JS `Date.toISOString()` string
+// ("2026-01-01T00:00:00.000Z"), while `datetime('now')` produces SQLite's
+// own format ("2026-01-01 00:00:00") — a plain string comparison between
+// the two is wrong whenever the calendar date matches (the 'T' vs ' '
+// separator sorts differently from the actual time), meaning this sweep
+// could fail to delete a session for up to a full day past its real
+// expiry. This is the same bug class found and fixed for messages.expiresAt
+// (Phase 5) and chat_locks lockout timestamps (Phase 6) — SQLite's
+// datetime() function itself can parse ISO 8601 input correctly, so
+// wrapping BOTH sides in datetime() normalizes the comparison regardless of
+// which format either value happens to be stored in. Verified directly:
+// a session that expired 60 seconds ago was incorrectly kept alive by the
+// old query and correctly caught by this one.
+//
+// Note: this was a data-hygiene bug, not a security hole — requireAuth and
+// the socket auth middleware independently re-check expiry via proper
+// `new Date(...).getTime()` arithmetic on every request/connection, so an
+// unswept expired session was never actually usable. It just wasn't being
+// cleaned out of the table the way the comment here always claimed.
 export function purgeExpiredSessions(): void {
-  db.prepare(`DELETE FROM sessions WHERE expiresAt < datetime('now')`).run();
+  db.prepare(`DELETE FROM sessions WHERE datetime(expiresAt) < datetime('now')`).run();
 }
 

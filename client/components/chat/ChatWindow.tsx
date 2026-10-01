@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback, useMemo, FormEvent } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo, FormEvent, ReactNode } from "react";
 import {
   Phone,
   Video,
@@ -41,8 +41,9 @@ import { setCachedPlaintext } from "@/lib/messageStore";
 import { IdentityKeyChangedError } from "@/lib/trust";
 import { SecurityVerification } from "@/components/chat/SecurityVerification";
 import { ChatLockPrompt } from "@/components/chat/ChatLockPrompt";
+import { ChatInfo } from "@/components/chat/ChatInfo";
 import { useChatLock } from "@/hooks/useChatLock";
-import { cn } from "@/lib/utils";
+import { cn, formatDay } from "@/lib/utils";
 
 const EMOJIS = ["😀", "😂", "😍", "🥰", "😎", "😭", "😡", "👍", "❤️", "🔥", "🎉", "🙏", "👏", "✨", "💯", "🤝"];
 
@@ -80,6 +81,7 @@ export function ChatWindow({ friendId }: { friendId: string }) {
   const [securityBlocked, setSecurityBlocked] = useState(false);
   const [securityWarning, setSecurityWarning] = useState(false);
   const [showUnlockPrompt, setShowUnlockPrompt] = useState(false);
+  const [showChatInfo, setShowChatInfo] = useState(false);
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
   const [viewOnceArmed, setViewOnceArmed] = useState(false);
   const [disappearingSeconds, setDisappearingSeconds] = useState(0);
@@ -89,10 +91,11 @@ export function ChatWindow({ friendId }: { friendId: string }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // FIFO queue of plaintexts for messages this device just sent, used to label
-  // our own encrypted-message echo without needing to (and being unable to)
-  // decrypt our own Olm ciphertext. See lib/messageDecrypt.ts for why.
-  const pendingOutgoingRef = useRef<string[]>([]);
+  // Correlate each encrypted echo with the exact local plaintext that created
+  // it. FIFO matching is unsafe when messages are rejected, reordered, or
+  // multiple sends are in flight at once.
+  const pendingOutgoingRef = useRef<Map<string, string>>(new Map());
+  const firstUnreadIdRef = useRef<string | null>(null);
   // Do not decrypt live Olm messages while the initial history is still being
   // hydrated. A type-1 Olm message depends on the ratchet state created by
   // earlier type-0 messages, so racing live delivery against history loading
@@ -115,6 +118,10 @@ export function ChatWindow({ friendId }: { friendId: string }) {
       ]);
       if (signal?.aborted) return;
       setFriend(userRes.user);
+      if (!background) {
+        const firstUnread = msgRes.messages.find((m) => m.senderId === friendId && m.status !== "seen");
+        firstUnreadIdRef.current = firstUnread?.id ?? null;
+      }
       const resolved = user ? await resolveMessageList(msgRes.messages, user.id, friendId, signal) : msgRes.messages;
       setMessages(resolved);
       if (resolved.some((m) => m.securityCodeChanged)) setSecurityWarning(true);
@@ -159,7 +166,10 @@ export function ChatWindow({ friendId }: { friendId: string }) {
       // when the same message arrives via the socket while history is loading.
       await historyReadyRef.current;
       const pendingOwnPlaintext =
-        msg.senderId === user?.id && msg.isEncrypted ? pendingOutgoingRef.current.shift() : undefined;
+        msg.senderId === user?.id && msg.isEncrypted && msg.clientMessageId
+          ? pendingOutgoingRef.current.get(msg.clientMessageId)
+          : undefined;
+      if (msg.clientMessageId) pendingOutgoingRef.current.delete(msg.clientMessageId);
       const resolved = user
         ? await resolveMessagePlaintext(msg, user.id, friendId, pendingOwnPlaintext)
         : msg;
@@ -172,6 +182,12 @@ export function ChatWindow({ friendId }: { friendId: string }) {
       });
       if (msg.senderId === friendId) socket?.emit("message_seen", { friendId });
       requestAnimationFrame(() => scrollToBottom(true));
+    };
+
+    const onErrorMessage = (data: { error?: string; clientMessageId?: string; receiverId?: string }) => {
+      if (data?.receiverId && data.receiverId !== friendId) return;
+      if (data?.clientMessageId) pendingOutgoingRef.current.delete(data.clientMessageId);
+      if (data?.error) setError(data.error);
     };
 
     const onMessageUpdated = async (msg: Message) => {
@@ -210,23 +226,45 @@ export function ChatWindow({ friendId }: { friendId: string }) {
       setDisappearingSeconds(data.seconds);
     };
 
+    const onMessageHidden = (data: { messageId: string }) => {
+      setMessages((prev) => {
+        const next = prev.filter((m) => m.id !== data.messageId);
+        updateCachedMessages(friendId, next);
+        return next;
+      });
+    };
+
+    const onMessageStarred = (data: { messageId: string; starred: boolean }) => {
+      setMessages((prev) => {
+        const next = prev.map((m) => (m.id === data.messageId ? { ...m, isStarred: data.starred } : m));
+        updateCachedMessages(friendId, next);
+        return next;
+      });
+    };
+
     socket.on("receive_message", onReceive);
+    socket.on("error_message", onErrorMessage);
     socket.on("message_updated", onMessageUpdated);
     socket.on("message_seen", onSeen);
     socket.on("typing", onTyping);
     socket.on("stop_typing", onStopTyping);
     socket.on("message_expired", onMessageExpired);
     socket.on("disappearing_timer_changed", onDisappearingTimerChanged);
+    socket.on("message_hidden", onMessageHidden);
+    socket.on("message_starred", onMessageStarred);
     socket.emit("message_seen", { friendId });
 
     return () => {
       socket.off("receive_message", onReceive);
+      socket.off("error_message", onErrorMessage);
       socket.off("message_updated", onMessageUpdated);
       socket.off("message_seen", onSeen);
       socket.off("typing", onTyping);
       socket.off("stop_typing", onStopTyping);
       socket.off("message_expired", onMessageExpired);
       socket.off("disappearing_timer_changed", onDisappearingTimerChanged);
+      socket.off("message_hidden", onMessageHidden);
+      socket.off("message_starred", onMessageStarred);
     };
   }, [socket, friendId, scrollToBottom, user]);
 
@@ -304,8 +342,14 @@ export function ChatWindow({ friendId }: { friendId: string }) {
         socket.emit("edit_message", { messageId: editing.id, ...encrypted });
         setEditing(null);
       } else {
-        pendingOutgoingRef.current.push(content);
-        socket.emit("send_message", { receiverId: friendId, replyToId: replyTo?.id ?? null, ...encrypted });
+        const clientMessageId = crypto.randomUUID();
+        pendingOutgoingRef.current.set(clientMessageId, content);
+        socket.emit("send_message", {
+          receiverId: friendId,
+          replyToId: replyTo?.id ?? null,
+          clientMessageId,
+          ...encrypted,
+        });
         setReplyTo(null);
       }
     } catch (err) {
@@ -335,13 +379,15 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     try {
       const meta = await encryptAndUploadAttachment(file, friendId, viewOnce);
       const encrypted = await encryptForPeer(friendId, JSON.stringify(meta));
+      const clientMessageId = crypto.randomUUID();
+      pendingOutgoingRef.current.set(clientMessageId, JSON.stringify(meta));
       socket.emit("send_message", {
         receiverId: friendId,
         replyToId: replyTo?.id ?? null,
         attachmentId: meta.attachmentId,
+        clientMessageId,
         ...encrypted,
       });
-      pendingOutgoingRef.current.push(JSON.stringify(meta));
       setReplyTo(null);
     } catch (err) {
       if (err instanceof IdentityKeyChangedError) {
@@ -362,8 +408,28 @@ export function ChatWindow({ friendId }: { friendId: string }) {
   }, []);
 
   const handleDelete = useCallback((message: Message) => {
-    if (window.confirm("Delete this message?")) socket?.emit("delete_message", { messageId: message.id });
+    if (window.confirm("Delete this message for everyone?")) socket?.emit("delete_message", { messageId: message.id });
   }, [socket]);
+
+  const handleDeleteForMe = useCallback((message: Message) => {
+    socket?.emit("delete_message_for_me", { messageId: message.id });
+    // Removed optimistically — the server only ever echoes this back to us,
+    // and there's nothing to undo it with, so no need to wait for the
+    // message_hidden confirmation before updating the view.
+    setMessages((prev) => prev.filter((m) => m.id !== message.id));
+  }, [socket]);
+
+  const handleToggleStar = useCallback((message: Message) => {
+    socket?.emit(message.isStarred ? "unstar_message" : "star_message", { messageId: message.id });
+  }, [socket]);
+
+  const handleJumpToReply = useCallback((messageId: string) => {
+    const el = document.getElementById(`message-${messageId}`);
+    if (!el) return; // the replied-to message isn't in the currently loaded page of history
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("ring-2", "ring-accent");
+    setTimeout(() => el.classList.remove("ring-2", "ring-accent"), 1500);
+  }, []);
 
   const handleEdit = useCallback((message: Message) => {
     setEditing(message);
@@ -390,12 +456,51 @@ export function ChatWindow({ friendId }: { friendId: string }) {
   const online = onlineUserIds.has(friendId);
   const statusLabel = isTyping ? "typing..." : online ? "Online" : "Offline";
 
-  const renderedMessages = useMemo(
-    () => filteredMessages.map((m) => (
-      <MessageBubble key={m.id} message={m} isOwn={m.senderId === user?.id} onReply={handleReply} onEdit={handleEdit} onDelete={handleDelete} onReact={handleReact} />
-    )),
-    [filteredMessages, user?.id, handleReply, handleEdit, handleDelete, handleReact]
-  );
+  // Interleaves a date-separator label whenever consecutive messages cross a
+  // calendar day boundary, and wraps each bubble with an id anchor so
+  // handleJumpToReply can scroll to it.
+  const renderedMessages = useMemo(() => {
+    const nodes: ReactNode[] = [];
+    let lastDay: string | null = null;
+    for (const m of filteredMessages) {
+      const day = new Date(m.createdAt.replace(" ", "T") + "Z").toDateString();
+      if (day !== lastDay) {
+        nodes.push(
+          <div key={`sep-${day}-${m.id}`} className="my-2 flex items-center justify-center">
+            <span className="rounded-full bg-surface-hover px-3 py-1 text-[11px] font-medium text-muted">
+              {formatDay(m.createdAt)}
+            </span>
+          </div>
+        );
+        lastDay = day;
+      }
+      if (m.id === firstUnreadIdRef.current) {
+        nodes.push(
+          <div key={`unread-${m.id}`} className="my-2 flex items-center gap-2">
+            <div className="h-px flex-1 bg-danger/30" />
+            <span className="text-[11px] font-medium text-danger">Unread messages</span>
+            <div className="h-px flex-1 bg-danger/30" />
+          </div>
+        );
+      }
+      nodes.push(
+        <div key={m.id} id={`message-${m.id}`} className="rounded-lg transition-shadow">
+          <MessageBubble
+            message={m}
+            isOwn={m.senderId === user?.id}
+            onReply={handleReply}
+            onEdit={handleEdit}
+            onDelete={handleDelete}
+            onDeleteForMe={handleDeleteForMe}
+            onReact={handleReact}
+            onToggleStar={handleToggleStar}
+            onJumpToReply={handleJumpToReply}
+          />
+        </div>
+      );
+    }
+    return nodes;
+  }, [filteredMessages, user?.id, handleReply, handleEdit, handleDelete, handleDeleteForMe, handleReact, handleToggleStar, handleJumpToReply]);
 
   if (loading) {
     return (
@@ -426,8 +531,10 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     <div className="flex h-full min-w-0 flex-1 flex-col">
       <div className="safe-top sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-surface/95 p-2.5 backdrop-blur-sm">
         <FastNavLink href="/chats" className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full hover:bg-surface-hover sm:hidden" aria-label="Back to chats"><ArrowLeft size={20} /></FastNavLink>
-        <Avatar src={friend.avatar} name={friend.username} size={40} online={online} />
-        <div className="min-w-0 flex-1"><p className="truncate font-medium leading-tight">{friend.username}</p><p className="truncate text-xs text-muted" aria-live="polite">{statusLabel}</p></div>
+        <button onClick={() => setShowChatInfo(true)} className="flex min-w-0 flex-1 items-center gap-2 rounded-lg py-1 text-left hover:bg-surface-hover" aria-label="Open chat info">
+          <Avatar src={friend.avatar} name={friend.username} size={40} online={online} />
+          <div className="min-w-0 flex-1"><p className="truncate font-medium leading-tight">{friend.username}</p><p className="truncate text-xs text-muted" aria-live="polite">{statusLabel}</p></div>
+        </button>
         <button onClick={() => setShowSearch((v) => !v)} className="flex h-11 w-11 items-center justify-center rounded-full text-muted hover:bg-surface-hover hover:text-foreground" aria-label="Search messages"><Search size={19} /></button>
         <div className="relative">
           <button
@@ -593,6 +700,25 @@ export function ChatWindow({ friendId }: { friendId: string }) {
             setSecurityBlocked(false);
             setSecurityWarning(false);
             handleSend();
+          }}
+        />
+      )}
+
+      {showChatInfo && (
+        <ChatInfo
+          friend={friend}
+          selfId={user?.id ?? ""}
+          messages={messages}
+          disappearingSeconds={disappearingSeconds}
+          socket={socket}
+          onClose={() => setShowChatInfo(false)}
+          onOpenSecurity={() => {
+            setShowChatInfo(false);
+            setShowSecurity(true);
+          }}
+          onCleared={() => {
+            setMessages([]);
+            updateCachedMessages(friendId, []);
           }}
         />
       )}

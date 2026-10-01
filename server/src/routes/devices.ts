@@ -2,7 +2,7 @@ import { Router, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { db } from "../db";
 import { requireAuth, AuthedRequest, describeDevice } from "../middleware/auth";
-import { DeviceRow, OneTimePrekeyRow, PrekeyBundle, PublicDevice } from "../types";
+import { DeviceRow, PrekeyBundle, PublicDevice } from "../types";
 import { sanitizeString, areFriends, isBlocked } from "../utils/helpers";
 import { sensitiveSettingsLimiter } from "../middleware/rateLimit";
 
@@ -164,7 +164,12 @@ router.post("/prekeys", requireAuth, sensitiveSettingsLimiter, (req: AuthedReque
 router.get("/bundle/:userId", requireAuth, (req: AuthedRequest, res: Response) => {
   const requesterId = req.user!.userId;
   const targetUserId = req.params.userId;
+  const requestedDeviceId = typeof req.query.deviceId === "string" ? req.query.deviceId.slice(0, 100) : "";
 
+  if (!requestedDeviceId) {
+    res.status(400).json({ error: "deviceId is required when establishing an encrypted session" });
+    return;
+  }
   if (targetUserId !== requesterId && !areFriends(requesterId, targetUserId)) {
     res.status(403).json({ error: "You can only establish encrypted sessions with friends" });
     return;
@@ -174,42 +179,60 @@ router.get("/bundle/:userId", requireAuth, (req: AuthedRequest, res: Response) =
     return;
   }
 
-  const devices = db
-    .prepare(`SELECT * FROM devices WHERE userId = ? AND revokedAt IS NULL ORDER BY lastActiveAt DESC`)
-    .all(targetUserId) as DeviceRow[];
+  const device = db
+    .prepare(`SELECT * FROM devices WHERE id = ? AND userId = ? AND revokedAt IS NULL`)
+    .get(requestedDeviceId, targetUserId) as DeviceRow | undefined;
 
-  const bundles: PrekeyBundle[] = devices.map((device) => {
-    const otk = db
+  if (!device) {
+    res.status(404).json({ error: "Encryption device not found or revoked" });
+    return;
+  }
+
+  // Claim the OTK with a conditional UPDATE. The old SELECT-then-UPDATE
+  // sequence had a race: two simultaneous requests could both read the same
+  // unclaimed key before either request marked it claimed. Only the request
+  // whose UPDATE changes one row is allowed to receive the key.
+  let oneTimeKey: PrekeyBundle["oneTimeKey"] = null;
+  for (let attempt = 0; attempt < 3 && !oneTimeKey; attempt += 1) {
+    const candidate = db
       .prepare(
-        `SELECT * FROM one_time_prekeys WHERE deviceId = ? AND claimedAt IS NULL ORDER BY createdAt ASC LIMIT 1`
+        `SELECT id, keyId, publicKey FROM one_time_prekeys
+         WHERE deviceId = ? AND claimedAt IS NULL
+         ORDER BY createdAt ASC LIMIT 1`
       )
-      .get(device.id) as OneTimePrekeyRow | undefined;
+      .get(device.id) as { id: string; keyId: string; publicKey: string } | undefined;
 
-    let oneTimeKey: PrekeyBundle["oneTimeKey"] = null;
-    if (otk) {
-      db.prepare(`UPDATE one_time_prekeys SET claimedByUserId = ?, claimedAt = datetime('now') WHERE id = ?`).run(
-        requesterId,
-        otk.id
-      );
-      oneTimeKey = { keyId: otk.keyId, publicKey: otk.publicKey };
+    if (!candidate) break;
+
+    const claimed = db
+      .prepare(
+        `UPDATE one_time_prekeys
+         SET claimedByUserId = ?, claimedAt = datetime('now')
+         WHERE id = ? AND deviceId = ? AND claimedAt IS NULL`
+      )
+      .run(requesterId, candidate.id, device.id);
+
+    if (claimed.changes === 1) {
+      oneTimeKey = { keyId: candidate.keyId, publicKey: candidate.publicKey };
     }
+  }
 
-    const fallbackKey =
-      !oneTimeKey && device.fallbackKey && device.fallbackKeyId && device.fallbackKeySignature
-        ? { keyId: device.fallbackKeyId, publicKey: device.fallbackKey, signature: device.fallbackKeySignature }
-        : null;
+  const fallbackKey =
+    !oneTimeKey && device.fallbackKey && device.fallbackKeyId && device.fallbackKeySignature
+      ? { keyId: device.fallbackKeyId, publicKey: device.fallbackKey, signature: device.fallbackKeySignature }
+      : null;
 
-    return {
+  res.json({
+    userId: targetUserId,
+    devices: [{
       deviceId: device.id,
       deviceName: device.name,
       curveIdentityKey: device.curveIdentityKey,
       ed25519IdentityKey: device.ed25519IdentityKey,
       oneTimeKey,
       fallbackKey,
-    };
+    }],
   });
-
-  res.json({ userId: targetUserId, devices: bundles });
 });
 
 /**

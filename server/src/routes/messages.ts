@@ -1,5 +1,14 @@
 import { Router, Response } from "express";
-import { db, getDisappearingSeconds, isConversationLocked } from "../db";
+import {
+  db,
+  getDisappearingSeconds,
+  isConversationLocked,
+  getStarredMessageIds,
+  getStarredMessagesForUser,
+  isOnlineStatusVisible,
+  isConversationMuted,
+  clearConversationForUser,
+} from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { MessageRow, UserRow } from "../types";
 import { areFriends, toPublicUser } from "../utils/helpers";
@@ -73,7 +82,7 @@ router.get("/conversations", requireAuth, (req: AuthedRequest, res: Response) =>
     ).c;
 
     return {
-      friend: { ...toPublicUser(friend), online: isUserOnline(friend.id) },
+      friend: { ...toPublicUser(friend), online: isOnlineStatusVisible(friend.id) && isUserOnline(friend.id) },
       lastMessage: isConversationLocked(userId, friend.id)
         ? redactLockedMessage(lastMessage)
         : lastMessage
@@ -93,6 +102,13 @@ router.get("/conversations", requireAuth, (req: AuthedRequest, res: Response) =>
   res.json({ conversations });
 });
 
+router.get("/starred", requireAuth, (req: AuthedRequest, res: Response) => {
+  const userId = req.user!.userId;
+  const rows = getStarredMessagesForUser(userId);
+  const messages = rows.map((r) => ({ ...normalizeMessage(r), starredAt: r.starredAt, isStarred: true }));
+  res.json({ messages });
+});
+
 router.get("/:friendId", requireAuth, (req: AuthedRequest, res: Response) => {
   const userId = req.user!.userId;
   const friendId = req.params.friendId;
@@ -108,7 +124,7 @@ router.get("/:friendId", requireAuth, (req: AuthedRequest, res: Response) => {
     return;
   }
 
-  const params: (string | number)[] = [userId, friendId, friendId, userId];
+  const params: (string | number)[] = [userId, friendId, friendId, userId, userId];
   let timeClause = "";
   if (before && beforeId) {
     timeClause = " AND (m.createdAt < ? OR (m.createdAt = ? AND m.id < ?))";
@@ -125,12 +141,15 @@ router.get("/:friendId", requireAuth, (req: AuthedRequest, res: Response) => {
        FROM messages m
        LEFT JOIN messages r ON r.id = m.replyToId
        WHERE ((m.senderId = ? AND m.receiverId = ?) OR (m.senderId = ? AND m.receiverId = ?))
+       AND NOT EXISTS (SELECT 1 FROM deleted_for_user d WHERE d.userId = ? AND d.messageId = m.id)
        ${timeClause}
        ORDER BY m.createdAt DESC, m.id DESC LIMIT ?`
     )
     .all(...params) as MessageRow[];
 
   const messages = rows.reverse().map(normalizeMessage);
+  const starredIds = getStarredMessageIds(userId, messages.map((m) => m.id));
+  const messagesWithStars = messages.map((m) => ({ ...m, isStarred: starredIds.has(m.id) }));
 
   const privacy = db.prepare(
     `SELECT readReceipts FROM privacy_settings WHERE userId = ?`
@@ -146,11 +165,70 @@ router.get("/:friendId", requireAuth, (req: AuthedRequest, res: Response) => {
   }
 
   res.json({
-    messages,
+    messages: messagesWithStars,
     hasMore: rows.length === limit,
     nextBefore: rows.length === limit ? rows[rows.length - 1]?.createdAt ?? null : null,
     nextBeforeId: rows.length === limit ? rows[rows.length - 1]?.id ?? null : null,
     disappearingSeconds: getDisappearingSeconds(userId, friendId),
+    isMuted: isConversationMuted(userId, friendId),
+  });
+});
+
+/**
+ * "Clear chat" — bulk delete-for-me across the whole conversation. Only
+ * ever affects the requester's own view; see clearConversationForUser's
+ * doc comment in db/index.ts for why this is the same operation as "delete
+ * conversation" from this account's point of view.
+ */
+router.post("/:friendId/clear", requireAuth, (req: AuthedRequest, res: Response) => {
+  const userId = req.user!.userId;
+  const friendId = req.params.friendId;
+  clearConversationForUser(userId, friendId);
+  res.json({ success: true });
+});
+
+/**
+ * Paginated feed of messages in this conversation that carry an attachment,
+ * for the Chat Info media gallery. The server can tell WHICH messages have
+ * an attachment (via the attachments table's messageId link) but not what
+ * KIND of media it is — that's inside the Olm-encrypted message content,
+ * which the server never has plaintext for. The client fetches this feed,
+ * decrypts each message's metadata locally, and sorts into images/videos/
+ * audio/files itself. There is no equivalent feed for "links" — a URL
+ * inside plain message text isn't something the server can detect at all
+ * for an encrypted conversation; that stays a client-side-only, loaded-
+ * history-only feature (see lib/linkExtraction.ts on the client).
+ */
+router.get("/:friendId/media", requireAuth, (req: AuthedRequest, res: Response) => {
+  const userId = req.user!.userId;
+  const friendId = req.params.friendId;
+  const before = typeof req.query.before === "string" ? req.query.before : null;
+  const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 60);
+
+  const params: (string | number)[] = [userId, friendId, friendId, userId, userId];
+  let timeClause = "";
+  if (before) {
+    timeClause = " AND m.createdAt < ?";
+    params.push(before);
+  }
+  params.push(limit);
+
+  const rows = db
+    .prepare(
+      `SELECT m.* FROM messages m
+       WHERE ((m.senderId = ? AND m.receiverId = ?) OR (m.senderId = ? AND m.receiverId = ?))
+       AND NOT EXISTS (SELECT 1 FROM deleted_for_user d WHERE d.userId = ? AND d.messageId = m.id)
+       AND EXISTS (SELECT 1 FROM attachments a WHERE a.messageId = m.id)
+       ${timeClause}
+       ORDER BY m.createdAt DESC, m.id DESC LIMIT ?`
+    )
+    .all(...params) as MessageRow[];
+
+  const messages = rows.map(normalizeMessage);
+  res.json({
+    messages,
+    hasMore: rows.length === limit,
+    nextBefore: rows.length === limit ? rows[rows.length - 1]?.createdAt ?? null : null,
   });
 });
 

@@ -1,6 +1,6 @@
 import { Router, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
-import { db } from "../db";
+import { db, isOnlineStatusVisible } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { UserRow, FriendRequestRow } from "../types";
 import { toPublicUser, createNotification, isBlocked } from "../utils/helpers";
@@ -17,7 +17,7 @@ router.get("/", requireAuth, (req: AuthedRequest, res: Response) => {
       `SELECT u.* FROM friends f JOIN users u ON u.id = f.friendId WHERE f.userId = ? ORDER BY u.username ASC`
     )
     .all(userId) as UserRow[];
-  res.json({ friends: rows.map((r) => ({ ...toPublicUser(r), online: isUserOnline(r.id) })) });
+  res.json({ friends: rows.map((r) => ({ ...toPublicUser(r), online: isOnlineStatusVisible(r.id) && isUserOnline(r.id) })) });
 });
 
 // Incoming + outgoing pending requests

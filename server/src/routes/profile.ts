@@ -3,7 +3,7 @@ import bcrypt from "bcryptjs";
 import { db } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
 import { UserRow } from "../types";
-import { toPublicUser, sanitizeString } from "../utils/helpers";
+import { toPrivateUser, sanitizeString } from "../utils/helpers";
 import { passwordChangeLimiter, accountDeletionLimiter } from "../middleware/rateLimit";
 
 const router = Router();
@@ -53,7 +53,7 @@ router.put("/", requireAuth, (req: AuthedRequest, res: Response) => {
   ).run(bio, avatar, username, firstName, lastName, userId);
 
   const updated = db.prepare(`SELECT * FROM users WHERE id = ?`).get(userId) as UserRow;
-  res.json({ user: toPublicUser(updated) });
+  res.json({ user: toPrivateUser(updated) });
 });
 
 router.put("/password", requireAuth, passwordChangeLimiter, (req: AuthedRequest, res: Response) => {

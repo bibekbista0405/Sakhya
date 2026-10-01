@@ -49,14 +49,14 @@ export default function RootLayout({
         <ThemeProvider>
           <AuthProvider>
             <SocketProvider>
-              <NotificationProvider>
-                <CallProvider>
-                  <ChatLockProvider>
+              <ChatLockProvider>
+                <NotificationProvider>
+                  <CallProvider>
                     {children}
                     <CallLayerLazy />
-                  </ChatLockProvider>
-                </CallProvider>
-              </NotificationProvider>
+                  </CallProvider>
+                </NotificationProvider>
+              </ChatLockProvider>
             </SocketProvider>
           </AuthProvider>
         </ThemeProvider>
