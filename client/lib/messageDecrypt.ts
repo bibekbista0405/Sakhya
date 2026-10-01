@@ -1,7 +1,7 @@
 "use client";
 
 import { Message } from "@/types";
-import { decryptFromPeer } from "./crypto";
+import { decryptFromPeer, getOwnDeviceId } from "./crypto";
 import { getCachedPlaintext, setCachedPlaintext } from "./messageStore";
 
 /**
@@ -39,23 +39,33 @@ export async function resolveMessagePlaintext(
     return { ...message, content: pendingOwnPlaintext, decryptError: false };
   }
 
-  if (message.senderId === selfUserId) {
-    // Our own encrypted message with no local plaintext record (e.g. sent
-    // from a different device/session, or the cache was cleared). Olm does
-    // not let a sender re-decrypt their own outbound ciphertext.
+  const ownDeviceId = await getOwnDeviceId();
+  const envelope = ownDeviceId
+    ? message.encryptedEnvelopes?.find((candidate) => candidate.recipientDeviceId === ownDeviceId)
+    : undefined;
+  // If this is a message sent from another device belonging to the same
+  // account, decrypt against selfUserId. The previous implementation treated
+  // every sender-self message as undecryptable, which prevented true
+  // multi-device history from working.
+  const ciphertext = envelope?.ciphertext ?? message.ciphertext;
+  const senderDeviceId = envelope?.senderDeviceId ?? message.senderDeviceId;
+  const olmMessageType = envelope?.olmMessageType ?? message.olmMessageType;
+  const decryptPeerUserId = message.senderId === selfUserId ? selfUserId : peerUserId;
+
+  if (message.senderId === selfUserId && !envelope) {
     return { ...message, content: "", decryptError: true };
   }
 
-  if (!message.ciphertext || !message.senderDeviceId || message.olmMessageType === null || message.olmMessageType === undefined) {
+  if (!ciphertext || !senderDeviceId || olmMessageType === null || olmMessageType === undefined) {
     return { ...message, content: "", decryptError: true };
   }
 
   try {
     const { plaintext, securityCodeChanged } = await decryptFromPeer(
-      peerUserId,
-      message.senderDeviceId,
-      message.ciphertext,
-      message.olmMessageType as 0 | 1
+      decryptPeerUserId,
+      senderDeviceId,
+      ciphertext,
+      olmMessageType as 0 | 1
     );
     await setCachedPlaintext(message.id, plaintext);
     return { ...message, content: plaintext, decryptError: false, securityCodeChanged };

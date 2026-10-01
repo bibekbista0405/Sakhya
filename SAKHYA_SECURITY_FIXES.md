@@ -25,9 +25,19 @@ This patch preserves the existing Sakhya architecture and UI.
 5. **Sender-device validation**
    - Encrypted messages are accepted only when `senderDeviceId` belongs to the authenticated user and is not revoked.
 
-## Intentionally not changed
+6. **Multi-device E2EE fan-out**
+   - Added `message_envelopes`, storing one Olm ciphertext per active recipient device while keeping one logical message row.
+   - Outgoing messages are independently encrypted for every active recipient device and for the sender's other active devices.
+   - Recipient devices select only their own envelope during local decryption.
+   - Trust pins are now device-specific.
 
-True multi-device E2EE fan-out is not implemented in this patch. The current message schema stores one ciphertext/message row. Implementing real fan-out safely requires a schema/protocol change so each recipient device receives its own Olm ciphertext without duplicating visible chat messages.
+7. **Multi-device edit/delete consistency**
+   - Encrypted edits replace all per-device envelopes atomically.
+   - "Delete for everyone" removes all encrypted envelopes as well as the legacy primary ciphertext.
+
+## Remaining work
+
+The next security phase is disappearing-message/local-plaintext cleanup, followed by WebRTC/TURN hardening, session/API hardening, and integration testing.
 
 ## Validation note
 

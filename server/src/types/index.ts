@@ -81,6 +81,14 @@ export interface MessageRow {
   olmMessageType?: number | null;
   senderDeviceId?: string | null;
   expiresAt?: string | null;
+  encryptedEnvelopes?: MessageEnvelope[];
+}
+
+export interface MessageEnvelope {
+  recipientDeviceId: string;
+  senderDeviceId: string;
+  ciphertext: string;
+  olmMessageType: 0 | 1;
 }
 
 export interface CallRow {

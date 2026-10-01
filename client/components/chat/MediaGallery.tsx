@@ -5,6 +5,7 @@ import { FileText, Loader2, Image as ImageIcon } from "lucide-react";
 import { api } from "@/lib/api";
 import { Message, User } from "@/types";
 import { resolveMessagePlaintext } from "@/lib/messageDecrypt";
+import { getOwnDeviceId } from "@/lib/crypto";
 import { parseAttachmentMetadata, downloadAndDecryptAttachment, AttachmentMetadata } from "@/lib/attachments";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Button } from "@/components/ui/Button";
@@ -28,9 +29,11 @@ export function MediaGallery({ friend, selfId }: { friend: User; selfId: string 
 
   const loadPage = useCallback(
     async (before: string | null) => {
+      const deviceId = await getOwnDeviceId();
       const query = before ? `?before=${encodeURIComponent(before)}&limit=30` : "?limit=30";
+      const withDevice = `${query}&deviceId=${encodeURIComponent(deviceId ?? "")}`;
       const res = await api.get<{ messages: Message[]; hasMore: boolean; nextBefore: string | null }>(
-        `/messages/${friend.id}/media${query}`
+        `/messages/${friend.id}/media${withDevice}`
       );
       const resolved: GalleryItem[] = [];
       for (const m of res.messages) {

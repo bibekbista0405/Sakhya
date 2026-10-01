@@ -26,6 +26,7 @@ import {
   AttachmentRow,
   RTCSessionDescriptionInit,
   RTCIceCandidateInit,
+  MessageEnvelope,
 } from "../types";
 import { onlineUsers, setIo, emitToUser, isUserOnline } from "./registry";
 import { areFriends, createNotification, toPublicUser, sanitizeString, isBlocked } from "../utils/helpers";
@@ -79,7 +80,13 @@ function getMessage(id: string): MessageRow | undefined {
     )
     .get(id) as StoredMessageRow | undefined;
   if (!row) return undefined;
-  return { ...row, reactions: parseReactions(row.reactions) } as MessageRow;
+  const envelopes = db
+    .prepare(
+      `SELECT recipientDeviceId, senderDeviceId, ciphertext, olmMessageType
+       FROM message_envelopes WHERE messageId = ? ORDER BY recipientDeviceId ASC`
+    )
+    .all(id) as MessageEnvelope[];
+  return { ...row, reactions: parseReactions(row.reactions), encryptedEnvelopes: envelopes } as MessageRow;
 }
 
 function parseReactions(value: unknown): Record<string, string[]> {
@@ -165,6 +172,11 @@ export function initSocket(io: Server): void {
         senderDeviceId?: string;
         attachmentId?: string;
         clientMessageId?: string;
+        encryptedForDevices?: {
+          recipientDeviceId: string;
+          ciphertext: string;
+          olmMessageType: 0 | 1;
+        }[];
       }) => {
         const receiverId = data?.receiverId;
         const clientMessageId = typeof data?.clientMessageId === "string" ? data.clientMessageId.slice(0, 100) : null;
@@ -175,7 +187,21 @@ export function initSocket(io: Server): void {
         const ciphertext = typeof data?.ciphertext === "string" ? data.ciphertext.slice(0, 20000) : null;
         const olmMessageType = data?.olmMessageType === 0 || data?.olmMessageType === 1 ? data.olmMessageType : null;
         const senderDeviceId = typeof data?.senderDeviceId === "string" ? data.senderDeviceId.slice(0, 100) : null;
-        const isEncrypted = !!(ciphertext && olmMessageType !== null && senderDeviceId);
+        const encryptedForDevices = Array.isArray(data?.encryptedForDevices)
+          ? data.encryptedForDevices
+              .slice(0, 32)
+              .map((e) => ({
+                recipientDeviceId: typeof e?.recipientDeviceId === "string" ? e.recipientDeviceId.slice(0, 100) : "",
+                ciphertext: typeof e?.ciphertext === "string" ? e.ciphertext.slice(0, 20000) : "",
+                olmMessageType: e?.olmMessageType === 0 || e?.olmMessageType === 1 ? e.olmMessageType : null,
+              }))
+              .filter((e): e is { recipientDeviceId: string; ciphertext: string; olmMessageType: 0 | 1 } =>
+                !!e.recipientDeviceId && !!e.ciphertext && e.olmMessageType !== null
+              )
+          : [];
+        const primaryCiphertext = encryptedForDevices[0]?.ciphertext ?? ciphertext;
+        const primaryOlmMessageType = encryptedForDevices[0]?.olmMessageType ?? olmMessageType;
+        const isEncrypted = encryptedForDevices.length > 0 || !!(ciphertext && olmMessageType !== null && senderDeviceId);
 
         // Legacy path: plaintext content, kept only for backward compatibility
         // during rollout. New clients should always send the encrypted fields.
@@ -196,12 +222,26 @@ export function initSocket(io: Server): void {
         }
 
         if (isEncrypted) {
+          if (!senderDeviceId) {
+            socket.emit("error_message", { error: "Missing sender encryption device", clientMessageId, receiverId });
+            return;
+          }
           const senderDevice = db
             .prepare(`SELECT id FROM devices WHERE id = ? AND userId = ? AND revokedAt IS NULL`)
             .get(senderDeviceId, userId);
           if (!senderDevice) {
             socket.emit("error_message", { error: "Invalid or revoked encryption device", clientMessageId, receiverId });
             return;
+          }
+          if (encryptedForDevices.length > 0) {
+            const uniqueDeviceIds = [...new Set(encryptedForDevices.map((e) => e.recipientDeviceId))];
+            const activeRecipientIds = db
+              .prepare(`SELECT id FROM devices WHERE userId IN (?, ?) AND revokedAt IS NULL AND id IN (${uniqueDeviceIds.map(() => "?").join(",") || "''"})`)
+              .all(receiverId, userId, ...uniqueDeviceIds) as { id: string }[];
+            if (activeRecipientIds.length !== uniqueDeviceIds.length) {
+              socket.emit("error_message", { error: "One or more recipient encryption devices are invalid or revoked", clientMessageId, receiverId });
+              return;
+            }
           }
         }
 
@@ -255,10 +295,23 @@ export function initSocket(io: Server): void {
           status,
           replyToId,
           isEncrypted ? 1 : 0,
-          ciphertext,
-          olmMessageType,
+          primaryCiphertext,
+          primaryOlmMessageType,
           senderDeviceId
         );
+
+        if (isEncrypted && encryptedForDevices.length > 0) {
+          const insertEnvelope = db.prepare(
+            `INSERT INTO message_envelopes (messageId, recipientDeviceId, senderDeviceId, ciphertext, olmMessageType)
+             VALUES (?, ?, ?, ?, ?)`
+          );
+          const insertAll = db.transaction((envelopes: typeof encryptedForDevices) => {
+            for (const envelope of envelopes) {
+              insertEnvelope.run(id, envelope.recipientDeviceId, senderDeviceId, envelope.ciphertext, envelope.olmMessageType);
+            }
+          });
+          insertAll(encryptedForDevices);
+        }
 
         if (attachmentId) {
           db.prepare(`UPDATE attachments SET messageId = ? WHERE id = ?`).run(id, attachmentId);
@@ -304,21 +357,69 @@ export function initSocket(io: Server): void {
 
     socket.on(
       "edit_message",
-      (data: { messageId: string; content?: string; ciphertext?: string; olmMessageType?: 0 | 1; senderDeviceId?: string }) => {
+      (data: {
+        messageId: string;
+        content?: string;
+        ciphertext?: string;
+        olmMessageType?: 0 | 1;
+        senderDeviceId?: string;
+        encryptedForDevices?: { recipientDeviceId: string; ciphertext: string; olmMessageType: 0 | 1 }[];
+      }) => {
         const messageId = data?.messageId;
         const ciphertext = typeof data?.ciphertext === "string" ? data.ciphertext.slice(0, 20000) : null;
         const olmMessageType = data?.olmMessageType === 0 || data?.olmMessageType === 1 ? data.olmMessageType : null;
         const senderDeviceId = typeof data?.senderDeviceId === "string" ? data.senderDeviceId.slice(0, 100) : null;
-        const isEncrypted = !!(ciphertext && olmMessageType !== null && senderDeviceId);
+        const encryptedForDevices = Array.isArray(data?.encryptedForDevices)
+          ? data.encryptedForDevices
+              .slice(0, 32)
+              .map((e) => ({
+                recipientDeviceId: typeof e?.recipientDeviceId === "string" ? e.recipientDeviceId.slice(0, 100) : "",
+                ciphertext: typeof e?.ciphertext === "string" ? e.ciphertext.slice(0, 20000) : "",
+                olmMessageType: e?.olmMessageType === 0 || e?.olmMessageType === 1 ? e.olmMessageType : null,
+              }))
+              .filter((e): e is { recipientDeviceId: string; ciphertext: string; olmMessageType: 0 | 1 } =>
+                !!e.recipientDeviceId && !!e.ciphertext && e.olmMessageType !== null
+              )
+          : [];
+        const isEncrypted = encryptedForDevices.length > 0 || !!(ciphertext && olmMessageType !== null && senderDeviceId);
         const legacyContent = isEncrypted ? "" : sanitizeString(data?.content, 4000);
 
         if (!messageId || (!isEncrypted && !legacyContent)) return;
         const existing = db.prepare(`SELECT * FROM messages WHERE id = ?`).get(messageId) as MessageRow | undefined;
-        if (!existing || existing.senderId !== userId) return;
-        if (existing.deletedAt) return;
-        db.prepare(
-          `UPDATE messages SET content = ?, isEncrypted = ?, ciphertext = ?, olmMessageType = ?, senderDeviceId = ?, editedAt = datetime('now') WHERE id = ?`
-        ).run(legacyContent, isEncrypted ? 1 : 0, ciphertext, olmMessageType, senderDeviceId, messageId);
+        if (!existing || existing.senderId !== userId || existing.deletedAt) return;
+
+        if (isEncrypted) {
+          if (!senderDeviceId) return;
+          const senderDevice = db
+            .prepare(`SELECT id FROM devices WHERE id = ? AND userId = ? AND revokedAt IS NULL`)
+            .get(senderDeviceId, userId);
+          if (!senderDevice) return;
+          if (encryptedForDevices.length > 0) {
+            const uniqueIds = [...new Set(encryptedForDevices.map((e) => e.recipientDeviceId))];
+            const active = db
+              .prepare(`SELECT id FROM devices WHERE userId IN (?, ?) AND revokedAt IS NULL AND id IN (${uniqueIds.map(() => "?").join(",") || "''"})`)
+              .all(existing.receiverId, userId, ...uniqueIds) as { id: string }[];
+            if (active.length !== uniqueIds.length) return;
+          }
+        }
+
+        const primaryCiphertext = encryptedForDevices[0]?.ciphertext ?? ciphertext;
+        const primaryType = encryptedForDevices[0]?.olmMessageType ?? olmMessageType;
+        db.transaction(() => {
+          db.prepare(
+            `UPDATE messages SET content = ?, isEncrypted = ?, ciphertext = ?, olmMessageType = ?, senderDeviceId = ?, editedAt = datetime('now') WHERE id = ?`
+          ).run(legacyContent, isEncrypted ? 1 : 0, primaryCiphertext, primaryType, senderDeviceId, messageId);
+          db.prepare(`DELETE FROM message_envelopes WHERE messageId = ?`).run(messageId);
+          if (isEncrypted && encryptedForDevices.length > 0) {
+            const insertEnvelope = db.prepare(
+              `INSERT INTO message_envelopes (messageId, recipientDeviceId, senderDeviceId, ciphertext, olmMessageType) VALUES (?, ?, ?, ?, ?)`
+            );
+            for (const envelope of encryptedForDevices) {
+              insertEnvelope.run(messageId, envelope.recipientDeviceId, senderDeviceId, envelope.ciphertext, envelope.olmMessageType);
+            }
+          }
+        })();
+
         const message = getMessage(messageId);
         if (message) sendMessageToParticipants(message);
       }
@@ -341,9 +442,12 @@ export function initSocket(io: Server): void {
         db.prepare(`DELETE FROM attachments WHERE id = ?`).run(a.id);
       }
 
-      db.prepare(
-        `UPDATE messages SET content = '', ciphertext = NULL, olmMessageType = NULL, deletedAt = datetime('now'), editedAt = NULL WHERE id = ?`
-      ).run(messageId);
+      db.transaction(() => {
+        db.prepare(`DELETE FROM message_envelopes WHERE messageId = ?`).run(messageId);
+        db.prepare(
+          `UPDATE messages SET content = '', ciphertext = NULL, olmMessageType = NULL, deletedAt = datetime('now'), editedAt = NULL WHERE id = ?`
+        ).run(messageId);
+      })();
       const message = getMessage(messageId);
       if (message) sendMessageToParticipants(message);
     });

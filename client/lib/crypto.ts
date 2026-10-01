@@ -230,35 +230,38 @@ async function maybeTopUpOneTimeKeysLocked(): Promise<void> {
   await persistAccount(account);
 }
 
-async function getPeerIdentity(peerUserId: string): Promise<PeerIdentityCacheEntry | null> {
+async function getPeerIdentities(peerUserId: string): Promise<PeerIdentityCacheEntry[]> {
   const res = await api.get<{ devices: { id: string; curveIdentityKey: string; ed25519IdentityKey: string }[] }>(
     `/devices/identity/${peerUserId}`
   );
-  const device = res.devices[0]; // Most-recently-active device; see multi-device limitation below.
-  if (!device) return null;
-  return {
+  return res.devices.map((device) => ({
     deviceId: device.id,
     curveIdentityKey: device.curveIdentityKey,
     ed25519IdentityKey: device.ed25519IdentityKey,
     fetchedAt: Date.now(),
-  };
+  }));
+}
+
+export interface EncryptedDeviceEnvelope {
+  recipientDeviceId: string;
+  ciphertext: string;
+  olmMessageType: 0 | 1;
 }
 
 export interface EncryptedPayload {
+  // Primary envelope fields remain for backwards compatibility with older
+  // stored rows. New clients should use encryptedForDevices.
   ciphertext: string;
   olmMessageType: 0 | 1;
   senderDeviceId: string;
+  encryptedForDevices: EncryptedDeviceEnvelope[];
 }
 
 /**
- * Encrypts a plaintext message for a peer's device.
- *
- * KNOWN LIMITATION: if the recipient has more than one registered device,
- * this only encrypts for their single most-recently-active device (the first
- * entry returned by the bundle endpoint). True multi-device fan-out (sending
- * a separately-encrypted copy to every device, as Signal/WhatsApp do) is not
- * implemented yet — a recipient reading from a second device will not see
- * messages sent while that device wasn't the "primary" one.
+ * Encrypts one logical plaintext independently for every active device owned
+ * by the peer. Each device gets its own Olm session/ratchet and therefore its
+ * own ciphertext. This is true multi-device fan-out: adding or revoking a
+ * device no longer silently changes which device receives messages.
  */
 export async function encryptForPeer(peerUserId: string, plaintext: string): Promise<EncryptedPayload> {
   await ensureDeviceRegistered();
@@ -268,60 +271,121 @@ export async function encryptForPeer(peerUserId: string, plaintext: string): Pro
 async function encryptForPeerLocked(peerUserId: string, plaintext: string): Promise<EncryptedPayload> {
   const account = await loadOrCreateAccount();
   const Olm = await loadOlm();
-
-  // Reuse an existing session with the peer's currently-known primary device
-  // if we have one; otherwise establish a new one via a fresh prekey bundle.
-  const identity = await getPeerIdentity(peerUserId);
-  if (!identity) {
+  const identities = await getPeerIdentities(peerUserId);
+  if (identities.length === 0) {
     throw new Error("This contact hasn't set up encryption on any device yet.");
   }
 
-  // Phase 3: refuse to send to a changed, unacknowledged identity key. The
-  // caller (UI) should catch IdentityKeyChangedError, show the new security
-  // code, and call acceptChangedIdentity() before retrying.
-  const trust = await checkIdentity(peerUserId, {
-    deviceId: identity.deviceId,
-    curveIdentityKey: identity.curveIdentityKey,
-    ed25519IdentityKey: identity.ed25519IdentityKey,
-  });
-  if (trust.changed) {
-    throw new IdentityKeyChangedError(peerUserId);
+  // Preflight every identity before mutating any Olm session. If one device
+  // changed identity, we must fail before advancing another device's ratchet;
+  // otherwise the eventual send failure could leave a session one message
+  // ahead and make the next message undecryptable.
+  for (const identity of identities) {
+    const trust = await checkIdentity(peerUserId, {
+      deviceId: identity.deviceId,
+      curveIdentityKey: identity.curveIdentityKey,
+      ed25519IdentityKey: identity.ed25519IdentityKey,
+    });
+    if (trust.changed) throw new IdentityKeyChangedError(peerUserId);
   }
 
-  const existing = await loadSession(peerUserId, identity.deviceId);
-  if (existing) {
-    const encrypted = existing.session.encrypt(plaintext);
-    await persistSession(peerUserId, identity.deviceId, existing.session, identity.curveIdentityKey);
-    existing.session.free();
-    return { ciphertext: encrypted.body, olmMessageType: encrypted.type, senderDeviceId: await requireOwnDeviceId() };
+  const ownDeviceId = await requireOwnDeviceId();
+  const ownDevicesRes = await api.get<{ devices: { id: string; curveIdentityKey: string; ed25519IdentityKey: string }[] }>("/devices");
+  const ownOtherDevices = ownDevicesRes.devices.filter((device) => device.id !== ownDeviceId);
+
+  type EncryptionTarget = { identity: PeerIdentityCacheEntry; isOwnDevice: boolean };
+  type EncryptionPlan =
+    | { target: EncryptionTarget; session: import("@matrix-org/olm").Session }
+    | { target: EncryptionTarget; outboundKey: string };
+  const targets: EncryptionTarget[] = [
+    ...identities.map((identity) => ({ identity, isOwnDevice: false })),
+    ...ownOtherDevices.map((device) => ({
+      identity: {
+        deviceId: device.id,
+        curveIdentityKey: device.curveIdentityKey,
+        ed25519IdentityKey: device.ed25519IdentityKey,
+        fetchedAt: Date.now(),
+      },
+      isOwnDevice: true,
+    })),
+  ];
+  const plans: EncryptionPlan[] = [];
+
+  // Resolve all sessions/prekeys before mutating any ratchet. Bundle claiming
+  // can consume a server-side one-time key, but it does not mutate our Olm
+  // account/session state. If a device is temporarily unavailable, skip only
+  // that device and continue fan-out to the healthy devices.
+  for (const target of targets) {
+    const { identity } = target;
+    const sessionPeerId = target.isOwnDevice ? (getIdbUserScope() as string) : peerUserId;
+    const existing = await loadSession(sessionPeerId, identity.deviceId);
+    if (existing) {
+      plans.push({ target, session: existing.session });
+      continue;
+    }
+
+    try {
+      const bundleRes = await api.get<{
+        devices: {
+          deviceId: string;
+          curveIdentityKey: string;
+          oneTimeKey: { keyId: string; publicKey: string } | null;
+          fallbackKey: { keyId: string; publicKey: string; signature: string } | null;
+        }[];
+      }>(`/devices/bundle/${target.isOwnDevice ? getIdbUserScope() : peerUserId}?deviceId=${encodeURIComponent(identity.deviceId)}`);
+      const bundle = bundleRes.devices[0];
+      const outboundKey = bundle?.oneTimeKey?.publicKey ?? bundle?.fallbackKey?.publicKey;
+      if (bundle && outboundKey) {
+        plans.push({
+          target: { ...target, identity: { ...identity, deviceId: bundle.deviceId, curveIdentityKey: bundle.curveIdentityKey } },
+          outboundKey,
+        });
+      }
+    } catch {
+      // One unavailable device must not block delivery to the peer's other
+      // active devices. It can establish its session on a later message.
+    }
   }
 
-  // No session yet: claim a prekey bundle (consumes a one-time key server-side).
-  const bundleRes = await api.get<{
-    devices: {
-      deviceId: string;
-      curveIdentityKey: string;
-      oneTimeKey: { keyId: string; publicKey: string } | null;
-      fallbackKey: { keyId: string; publicKey: string; signature: string } | null;
-    }[];
-  }>(`/devices/bundle/${peerUserId}?deviceId=${encodeURIComponent(identity.deviceId)}`);
-  const bundle = bundleRes.devices[0];
-  if (!bundle) {
-    throw new Error("This contact hasn't set up encryption on any device yet.");
-  }
-  const theirOtk = bundle.oneTimeKey?.publicKey ?? bundle.fallbackKey?.publicKey;
-  if (!theirOtk) {
-    throw new Error("This contact's device has no available prekeys to start a secure session.");
+  const envelopes: EncryptedDeviceEnvelope[] = [];
+  for (const plan of plans) {
+    const sessionPeerId = plan.target.isOwnDevice ? (getIdbUserScope() as string) : peerUserId;
+    if ("session" in plan) {
+      const encrypted = plan.session.encrypt(plaintext);
+      await persistSession(sessionPeerId, plan.target.identity.deviceId, plan.session, plan.target.identity.curveIdentityKey);
+      plan.session.free();
+      envelopes.push({
+        recipientDeviceId: plan.target.identity.deviceId,
+        ciphertext: encrypted.body,
+        olmMessageType: encrypted.type,
+      });
+      continue;
+    }
+
+    const session = new Olm.Session();
+    session.create_outbound(account, plan.target.identity.curveIdentityKey, plan.outboundKey);
+    const encrypted = session.encrypt(plaintext);
+    await persistSession(sessionPeerId, plan.target.identity.deviceId, session, plan.target.identity.curveIdentityKey);
+    session.free();
+    envelopes.push({
+      recipientDeviceId: plan.target.identity.deviceId,
+      ciphertext: encrypted.body,
+      olmMessageType: encrypted.type,
+    });
   }
 
-  const session = new Olm.Session();
-  session.create_outbound(account, bundle.curveIdentityKey, theirOtk);
-  const encrypted = session.encrypt(plaintext);
-  await persistSession(peerUserId, bundle.deviceId, session, bundle.curveIdentityKey);
-  session.free();
+  if (envelopes.length === 0) {
+    throw new Error("None of this contact's encryption devices has an available secure session.");
+  }
+
   await persistAccount(account);
-
-  return { ciphertext: encrypted.body, olmMessageType: encrypted.type, senderDeviceId: await requireOwnDeviceId() };
+  const senderDeviceId = await requireOwnDeviceId();
+  return {
+    ciphertext: envelopes[0].ciphertext,
+    olmMessageType: envelopes[0].olmMessageType,
+    senderDeviceId,
+    encryptedForDevices: envelopes,
+  };
 }
 
 /**
@@ -396,6 +460,10 @@ async function decryptFromPeerLocked(
   await persistSession(peerUserId, senderDeviceId, session, senderDevice.curveIdentityKey);
   session.free();
   return { plaintext, securityCodeChanged: trust.changed };
+}
+
+export async function getOwnDeviceId(): Promise<string | null> {
+  return idbGet<string>(DEVICE_ID_KEY);
 }
 
 async function requireOwnDeviceId(): Promise<string> {

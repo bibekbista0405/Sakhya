@@ -64,7 +64,7 @@ export function SecurityVerification({ friend, onClose, blockedOnChange, onAccep
         curveIdentityKey: peerDevice.curveIdentityKey,
         ed25519IdentityKey: peerDevice.ed25519IdentityKey,
       });
-      const pinned = await getPinnedIdentity(friend.id);
+      const pinned = await getPinnedIdentity(friend.id, peerDevice.id);
 
       const { groups, raw } = await computeSecurityCode(user.id, own.ed25519, friend.id, peerDevice.ed25519IdentityKey);
       const qrDataUrl = await QRCode.toDataURL(raw, { margin: 1, width: 220 });
@@ -103,8 +103,11 @@ export function SecurityVerification({ friend, onClose, blockedOnChange, onAccep
 
   const toggleVerified = async () => {
     if (state.status !== "ready") return;
-    if (state.verified) await markUnverified(friend.id);
-    else await markVerified(friend.id);
+    const identityRes = await api.get<{ devices: { id: string }[] }>(`/devices/identity/${friend.id}`);
+    const peerDevice = identityRes.devices[0];
+    if (!peerDevice) return;
+    if (state.verified) await markUnverified(friend.id, peerDevice.id);
+    else await markVerified(friend.id, peerDevice.id);
     await load();
   };
 

@@ -34,7 +34,7 @@ import { Button } from "@/components/ui/Button";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { MessageBubbleSkeleton } from "@/components/ui/Skeleton";
 import { MessageBubble } from "@/components/chat/MessageBubble";
-import { encryptForPeer } from "@/lib/crypto";
+import { encryptForPeer, getOwnDeviceId } from "@/lib/crypto";
 import { encryptAndUploadAttachment } from "@/lib/attachments";
 import { resolveMessagePlaintext, resolveMessageList } from "@/lib/messageDecrypt";
 import { setCachedPlaintext } from "@/lib/messageStore";
@@ -114,7 +114,7 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     try {
       const [userRes, msgRes] = await Promise.all([
         api.get<{ user: User }>(`/users/${friendId}`),
-        api.get<{ messages: Message[]; hasMore: boolean; disappearingSeconds?: number }>(`/messages/${friendId}?limit=100`),
+        api.get<{ messages: Message[]; hasMore: boolean; disappearingSeconds?: number }>(`/messages/${friendId}?limit=100&deviceId=${encodeURIComponent((await getOwnDeviceId()) ?? "")}`),
       ]);
       if (signal?.aborted) return;
       setFriend(userRes.user);
@@ -300,7 +300,8 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     try {
       const before = encodeURIComponent(messages[0].createdAt);
       const beforeId = encodeURIComponent(messages[0].id);
-      const res = await api.get<{ messages: Message[]; hasMore: boolean }>(`/messages/${friendId}?limit=100&before=${before}&beforeId=${beforeId}`);
+      const deviceId = await getOwnDeviceId();
+      const res = await api.get<{ messages: Message[]; hasMore: boolean }>(`/messages/${friendId}?limit=100&before=${before}&beforeId=${beforeId}&deviceId=${encodeURIComponent(deviceId ?? "")}`);
       setMessages((prev) => {
         const ids = new Set(prev.map((m) => m.id));
         const next = [...res.messages.filter((m) => !ids.has(m.id)), ...prev];

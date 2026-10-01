@@ -27,8 +27,8 @@ interface PinnedIdentity {
   firstSeenAt: string;
 }
 
-function trustKey(peerUserId: string): string {
-  return `sakhya:trust:${peerUserId}`;
+function trustKey(peerUserId: string, deviceId?: string): string {
+  return deviceId ? `sakhya:trust:${peerUserId}:${deviceId}` : `sakhya:trust:${peerUserId}`;
 }
 
 export class IdentityKeyChangedError extends Error {
@@ -38,8 +38,8 @@ export class IdentityKeyChangedError extends Error {
   }
 }
 
-export async function getPinnedIdentity(peerUserId: string): Promise<PinnedIdentity | undefined> {
-  return idbGet<PinnedIdentity>(trustKey(peerUserId));
+export async function getPinnedIdentity(peerUserId: string, deviceId?: string): Promise<PinnedIdentity | undefined> {
+  return idbGet<PinnedIdentity>(trustKey(peerUserId, deviceId));
 }
 
 /**
@@ -58,9 +58,9 @@ export async function checkIdentity(
   peerUserId: string,
   current: { deviceId: string; curveIdentityKey: string; ed25519IdentityKey: string }
 ): Promise<{ changed: boolean; previous?: PinnedIdentity }> {
-  const pinned = await getPinnedIdentity(peerUserId);
+  const pinned = await getPinnedIdentity(peerUserId, current.deviceId);
   if (!pinned) {
-    await idbSet(trustKey(peerUserId), {
+    await idbSet(trustKey(peerUserId, current.deviceId), {
       ...current,
       verified: false,
       verifiedAt: null,
@@ -79,7 +79,7 @@ export async function acceptChangedIdentity(
   peerUserId: string,
   current: { deviceId: string; curveIdentityKey: string; ed25519IdentityKey: string }
 ): Promise<void> {
-  await idbSet(trustKey(peerUserId), {
+  await idbSet(trustKey(peerUserId, current.deviceId), {
     ...current,
     verified: false,
     verifiedAt: null,
@@ -87,20 +87,20 @@ export async function acceptChangedIdentity(
   } satisfies PinnedIdentity);
 }
 
-export async function markVerified(peerUserId: string): Promise<void> {
-  const pinned = await getPinnedIdentity(peerUserId);
+export async function markVerified(peerUserId: string, deviceId?: string): Promise<void> {
+  const pinned = await getPinnedIdentity(peerUserId, deviceId);
   if (!pinned) return;
-  await idbSet(trustKey(peerUserId), {
+  await idbSet(trustKey(peerUserId, pinned.deviceId), {
     ...pinned,
     verified: true,
     verifiedAt: new Date().toISOString(),
   } satisfies PinnedIdentity);
 }
 
-export async function markUnverified(peerUserId: string): Promise<void> {
-  const pinned = await getPinnedIdentity(peerUserId);
+export async function markUnverified(peerUserId: string, deviceId?: string): Promise<void> {
+  const pinned = await getPinnedIdentity(peerUserId, deviceId);
   if (!pinned) return;
-  await idbSet(trustKey(peerUserId), { ...pinned, verified: false, verifiedAt: null } satisfies PinnedIdentity);
+  await idbSet(trustKey(peerUserId, pinned.deviceId), { ...pinned, verified: false, verifiedAt: null } satisfies PinnedIdentity);
 }
 
 /**

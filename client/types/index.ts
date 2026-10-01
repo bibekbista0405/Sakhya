@@ -40,6 +40,12 @@ export interface Message {
   // Ephemeral client correlation id used only to reconcile the sender's
   // local plaintext with the server echo. It is never persisted in SQLite.
   clientMessageId?: string;
+  encryptedEnvelopes?: {
+    recipientDeviceId: string;
+    senderDeviceId: string;
+    ciphertext: string;
+    olmMessageType: 0 | 1;
+  }[];
 }
 
 export interface Conversation {

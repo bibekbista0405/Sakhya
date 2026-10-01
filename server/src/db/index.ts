@@ -235,6 +235,25 @@ export function initDb(): void {
     }
   }
 
+  // --- Phase 2: per-device encrypted message envelopes ---
+  // A logical message is stored once in `messages`; each active recipient
+  // device gets its own Olm ciphertext in this table. This is the minimum
+  // schema change needed for real multi-device E2EE fan-out without copying
+  // the logical message, reactions, replies, timers, etc. once per device.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS message_envelopes (
+      messageId TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+      recipientDeviceId TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      senderDeviceId TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      ciphertext TEXT NOT NULL,
+      olmMessageType INTEGER NOT NULL,
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (messageId, recipientDeviceId)
+    );
+    CREATE INDEX IF NOT EXISTS idx_message_envelopes_recipient ON message_envelopes(recipientDeviceId, messageId);
+    CREATE INDEX IF NOT EXISTS idx_message_envelopes_message ON message_envelopes(messageId);
+  `);
+
   // --- Phase 4: encrypted media & files ---
   // The server stores only opaque AES-GCM ciphertext bytes on disk plus this
   // bookkeeping row. It never sees the file's plaintext bytes, its

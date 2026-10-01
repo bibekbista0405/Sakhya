@@ -10,7 +10,7 @@ import {
   clearConversationForUser,
 } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
-import { MessageRow, UserRow } from "../types";
+import { MessageEnvelope, MessageRow, UserRow } from "../types";
 import { areFriends, toPublicUser } from "../utils/helpers";
 import { isUserOnline } from "../socket/registry";
 
@@ -32,6 +32,33 @@ function parseReactions(value: unknown): Record<string, string[]> {
 
 function normalizeMessage(row: MessageRow & { reactions?: unknown }): MessageRow {
   return { ...row, reactions: parseReactions(row.reactions) };
+}
+
+function attachEncryptedEnvelopes(messages: MessageRow[]): MessageRow[] {
+  if (messages.length === 0) return messages;
+  const placeholders = messages.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT messageId, recipientDeviceId, senderDeviceId, ciphertext, olmMessageType
+       FROM message_envelopes WHERE messageId IN (${placeholders})
+       ORDER BY messageId, recipientDeviceId`
+    )
+    .all(...messages.map((m) => m.id)) as (MessageEnvelope & { messageId: string })[];
+  const byMessage = new Map<string, MessageEnvelope[]>();
+  for (const row of rows) {
+    const list = byMessage.get(row.messageId) ?? [];
+    list.push({
+      recipientDeviceId: row.recipientDeviceId,
+      senderDeviceId: row.senderDeviceId,
+      ciphertext: row.ciphertext,
+      olmMessageType: row.olmMessageType,
+    });
+    byMessage.set(row.messageId, list);
+  }
+  return messages.map((message) => ({
+    ...message,
+    encryptedEnvelopes: byMessage.get(message.id) ?? [],
+  }));
 }
 
 /**
@@ -105,7 +132,7 @@ router.get("/conversations", requireAuth, (req: AuthedRequest, res: Response) =>
 router.get("/starred", requireAuth, (req: AuthedRequest, res: Response) => {
   const userId = req.user!.userId;
   const rows = getStarredMessagesForUser(userId);
-  const messages = rows.map((r) => ({ ...normalizeMessage(r), starredAt: r.starredAt, isStarred: true }));
+  const messages = attachEncryptedEnvelopes(rows).map((r) => ({ ...normalizeMessage(r), starredAt: r.starredAt, isStarred: true }));
   res.json({ messages });
 });
 
@@ -147,7 +174,7 @@ router.get("/:friendId", requireAuth, (req: AuthedRequest, res: Response) => {
     )
     .all(...params) as MessageRow[];
 
-  const messages = rows.reverse().map(normalizeMessage);
+  const messages = attachEncryptedEnvelopes(rows.reverse()).map(normalizeMessage);
   const starredIds = getStarredMessageIds(userId, messages.map((m) => m.id));
   const messagesWithStars = messages.map((m) => ({ ...m, isStarred: starredIds.has(m.id) }));
 
@@ -224,7 +251,7 @@ router.get("/:friendId/media", requireAuth, (req: AuthedRequest, res: Response) 
     )
     .all(...params) as MessageRow[];
 
-  const messages = rows.map(normalizeMessage);
+  const messages = attachEncryptedEnvelopes(rows).map(normalizeMessage);
   res.json({
     messages,
     hasMore: rows.length === limit,
