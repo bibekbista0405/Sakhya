@@ -5,8 +5,8 @@ import path from "path";
 import { v4 as uuidv4 } from "uuid";
 import { db } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/auth";
-import { AttachmentRow } from "../types";
 import { areFriends, isBlocked } from "../utils/helpers";
+import { AttachmentRow } from "../types";
 import rateLimit from "express-rate-limit";
 
 const router = Router();
@@ -137,6 +137,11 @@ router.get("/:id", requireAuth, (req: AuthedRequest, res: Response) => {
     res.status(403).json({ error: "You do not have access to this attachment" });
     return;
   }
+  const peerId = attachment.senderId === userId ? attachment.receiverId : attachment.senderId;
+  if (!areFriends(userId, peerId) || isBlocked(userId, peerId)) {
+    res.status(403).json({ error: "This conversation is no longer available" });
+    return;
+  }
   if (attachment.consumedAt) {
     res.status(410).json({ error: "This media has already been viewed and is no longer available." });
     return;
@@ -183,6 +188,10 @@ router.post("/:id/consume", requireAuth, (req: AuthedRequest, res: Response) => 
   }
   if (attachment.receiverId !== userId) {
     res.status(403).json({ error: "Only the recipient can mark this as viewed" });
+    return;
+  }
+  if (!areFriends(userId, attachment.senderId) || isBlocked(userId, attachment.senderId)) {
+    res.status(403).json({ error: "This conversation is no longer available" });
     return;
   }
   if (!attachment.viewOnce) {

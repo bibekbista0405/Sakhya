@@ -42,7 +42,8 @@ export function initDb(): void {
       ip TEXT NOT NULL DEFAULT '',
       createdAt TEXT NOT NULL DEFAULT (datetime('now')),
       lastActiveAt TEXT NOT NULL DEFAULT (datetime('now')),
-      expiresAt TEXT NOT NULL
+      expiresAt TEXT NOT NULL,
+      deviceId TEXT REFERENCES devices(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS friend_requests (
@@ -241,7 +242,9 @@ export function initDb(): void {
         );
       `);
       if (hasLegacyToken) {
-        const rows = db.prepare(`SELECT id, userId, token, deviceName, userAgent, ip, createdAt, lastActiveAt, expiresAt, deviceId FROM sessions`).all() as Array<{
+        const legacySessionCols = sessionCols3;
+        const selectDeviceId = legacySessionCols.includes("deviceId") ? ", deviceId" : ", NULL AS deviceId";
+        const rows = db.prepare(`SELECT id, userId, token, deviceName, userAgent, ip, createdAt, lastActiveAt, expiresAt${selectDeviceId} FROM sessions`).all() as Array<{
           id: string; userId: string; token: string; deviceName: string; userAgent: string; ip: string;
           createdAt: string; lastActiveAt: string; expiresAt: string; deviceId?: string | null;
         }>;
@@ -262,7 +265,12 @@ export function initDb(): void {
     migrateSessions();
   }
 
+  const sessionColsAfterMigration = (db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[]).map((c) => c.name);
+  if (!sessionColsAfterMigration.includes("deviceId")) {
+    db.exec(`ALTER TABLE sessions ADD COLUMN deviceId TEXT REFERENCES devices(id) ON DELETE SET NULL`);
+  }
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(tokenHash);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_device ON sessions(deviceId);`);
 
   // Mark pre-Phase-2 messages as legacy plaintext so the client can render an
   // honest "not encrypted" indicator instead of silently implying they were

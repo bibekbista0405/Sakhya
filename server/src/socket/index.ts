@@ -34,6 +34,7 @@ import { areFriends, createNotification, toPublicUser, sanitizeString, isBlocked
 interface AuthedSocket extends Socket {
   userId?: string;
   username?: string;
+  sessionId?: string;
 }
 
 const activeCalls = new Map<
@@ -161,6 +162,7 @@ export function initSocket(io: Server): void {
       }
       socket.userId = payload.userId;
       socket.username = payload.username;
+      socket.sessionId = session.id;
       next();
     } catch {
       next(new Error("Invalid token"));
@@ -269,6 +271,13 @@ export function initSocket(io: Server): void {
             .get(senderDeviceId, userId);
           if (!senderDevice) {
             socket.emit("error_message", { error: "Invalid or revoked encryption device", clientMessageId, receiverId });
+            return;
+          }
+          const boundSession = db
+            .prepare(`SELECT deviceId FROM sessions WHERE id = ? AND userId = ?`)
+            .get(socket.sessionId ?? null, userId) as { deviceId?: string | null } | undefined;
+          if (boundSession?.deviceId && boundSession.deviceId !== senderDeviceId) {
+            socket.emit("error_message", { error: "Encryption device does not match this session", clientMessageId, receiverId });
             return;
           }
           if (encryptedForDevices.length > 0) {
@@ -432,6 +441,10 @@ export function initSocket(io: Server): void {
             .prepare(`SELECT id FROM devices WHERE id = ? AND userId = ? AND revokedAt IS NULL`)
             .get(senderDeviceId, userId);
           if (!senderDevice) return;
+          const boundSession = db
+            .prepare(`SELECT deviceId FROM sessions WHERE id = ? AND userId = ?`)
+            .get(socket.sessionId ?? null, userId) as { deviceId?: string | null } | undefined;
+          if (boundSession?.deviceId && boundSession.deviceId !== senderDeviceId) return;
           if (encryptedForDevices.length > 0) {
             const uniqueIds = [...new Set(encryptedForDevices.map((e) => e.recipientDeviceId))];
             const active = db

@@ -47,13 +47,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       .get<{ user: User }>("/auth/me")
       .then(async (res) => {
         setUser(res.user);
-        // Finish E2EE device registration before leaving the auth-loading state.
-        // This prevents the first chat screen from racing /devices/register.
-        try {
-          await ensureDeviceRegistered(res.user.id);
-        } catch (err) {
-          console.error("Device registration failed:", err);
-        }
+        // Authentication must not be blocked by cold-start E2EE/WASM/IndexedDB
+        // work. The crypto layer independently waits for registration when a
+        // message actually needs it. This keeps the first navigation responsive.
+        void ensureDeviceRegistered(res.user.id).catch((err) => {
+          console.error("Background device registration failed:", err);
+        });
       })
       .catch(() => {
         clearToken();
@@ -71,8 +70,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setToken(res.token, remember);
       setTokenState(res.token);
       setUser(res.user);
-      await ensureDeviceRegistered(res.user.id);
+      // Do not make login navigation wait for libolm/WASM, IndexedDB, key
+      // generation, and /devices/register. encrypt/decrypt paths call
+      // ensureDeviceRegistered themselves when crypto is actually needed.
       router.push("/chats");
+      void ensureDeviceRegistered(res.user.id).catch((err) => {
+        console.error("Background device registration failed:", err);
+      });
     },
     [router]
   );
@@ -83,8 +87,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setToken(res.token, true);
       setTokenState(res.token);
       setUser(res.user);
-      await ensureDeviceRegistered(res.user.id);
+      // Account creation should become interactive immediately; E2EE setup
+      // continues in the background and is awaited only by crypto operations.
       router.push("/chats");
+      void ensureDeviceRegistered(res.user.id).catch((err) => {
+        console.error("Background device registration failed:", err);
+      });
     },
     [router]
   );

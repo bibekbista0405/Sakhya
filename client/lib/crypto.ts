@@ -1,6 +1,6 @@
 "use client";
 
-import { api } from "./api";
+import { api, ApiError } from "./api";
 import { idbGet, idbSet, idbClearAll, setIdbUserScope, getIdbUserScope } from "./idb";
 import { checkIdentity, acceptChangedIdentity, IdentityKeyChangedError } from "./trust";
 
@@ -148,43 +148,58 @@ export function ensureDeviceRegistered(userId?: string): Promise<void> {
   if (!scopedUserId) return Promise.reject(new Error("Sakhya encryption account is not initialized yet."));
   if (deviceRegistrationPromise) return deviceRegistrationPromise;
 
-  deviceRegistrationPromise = (async () => {
+  const register = async (): Promise<void> => {
     const account = await loadOrCreateAccount();
-  const identityKeys = JSON.parse(account.identity_keys()) as {
-    curve25519: string;
-    ed25519: string;
+    const identityKeys = JSON.parse(account.identity_keys()) as {
+      curve25519: string;
+      ed25519: string;
+    };
+
+    const existingDeviceId = await idbGet<string>(DEVICE_ID_KEY);
+
+    // Generate a signed fallback key on first run so decrypt-side sessions can
+    // still be established even after the one-time-key pool is exhausted.
+    let fallbackPayload: { fallbackKeyId: string; fallbackKey: string; fallbackKeySignature: string } | null = null;
+    if (!existingDeviceId) {
+      account.generate_fallback_key();
+      const unpublished = JSON.parse(account.unpublished_fallback_key()) as { curve25519: Record<string, string> };
+      const [fallbackKeyId, fallbackKey] = Object.entries(unpublished.curve25519)[0];
+      const fallbackKeySignature = account.sign(fallbackKey);
+      fallbackPayload = { fallbackKeyId, fallbackKey, fallbackKeySignature };
+    }
+
+    const maxKeys = account.max_number_of_one_time_keys();
+    const wantKeys = Math.min(OTK_TARGET_COUNT, maxKeys);
+    account.generate_one_time_keys(wantKeys);
+    const generated = JSON.parse(account.one_time_keys()) as { curve25519: Record<string, string> };
+    const oneTimeKeys = Object.entries(generated.curve25519).map(([keyId, publicKey]) => ({ keyId, publicKey }));
+
+    try {
+      const res = await api.post<{ deviceId: string }>("/devices/register", {
+        curveIdentityKey: identityKeys.curve25519,
+        ed25519IdentityKey: identityKeys.ed25519,
+        oneTimeKeys,
+        ...(fallbackPayload ?? {}),
+      });
+
+      account.mark_keys_as_published();
+      await persistAccount(account);
+      await idbSet(DEVICE_ID_KEY, res.deviceId);
+    } catch (err) {
+      // A remotely revoked identity must never be resurrected. The server
+      // rejects it with 409; discard this local identity and retry once with a
+      // genuinely new Olm account/device identity.
+      if (err instanceof ApiError && err.status === 409 && /encryption identity has been revoked/i.test(err.message)) {
+        cachedAccount = null;
+        await idbClearAll();
+        await register();
+        return;
+      }
+      throw err;
+    }
   };
 
-  const existingDeviceId = await idbGet<string>(DEVICE_ID_KEY);
-
-  // Generate a signed fallback key on first run so decrypt-side sessions can
-  // still be established even after the one-time-key pool is exhausted.
-  let fallbackPayload: { fallbackKeyId: string; fallbackKey: string; fallbackKeySignature: string } | null = null;
-  if (!existingDeviceId) {
-    account.generate_fallback_key();
-    const unpublished = JSON.parse(account.unpublished_fallback_key()) as { curve25519: Record<string, string> };
-    const [fallbackKeyId, fallbackKey] = Object.entries(unpublished.curve25519)[0];
-    const fallbackKeySignature = account.sign(fallbackKey);
-    fallbackPayload = { fallbackKeyId, fallbackKey, fallbackKeySignature };
-  }
-
-  const maxKeys = account.max_number_of_one_time_keys();
-  const wantKeys = Math.min(OTK_TARGET_COUNT, maxKeys);
-  account.generate_one_time_keys(wantKeys);
-  const generated = JSON.parse(account.one_time_keys()) as { curve25519: Record<string, string> };
-  const oneTimeKeys = Object.entries(generated.curve25519).map(([keyId, publicKey]) => ({ keyId, publicKey }));
-
-  const res = await api.post<{ deviceId: string }>("/devices/register", {
-    curveIdentityKey: identityKeys.curve25519,
-    ed25519IdentityKey: identityKeys.ed25519,
-    oneTimeKeys,
-    ...(fallbackPayload ?? {}),
-  });
-
-    account.mark_keys_as_published();
-    await persistAccount(account);
-    await idbSet(DEVICE_ID_KEY, res.deviceId);
-  })().finally(() => {
+  deviceRegistrationPromise = register().finally(() => {
     deviceRegistrationPromise = null;
   });
 
@@ -463,7 +478,7 @@ async function decryptFromPeerLocked(
 }
 
 export async function getOwnDeviceId(): Promise<string | null> {
-  return idbGet<string>(DEVICE_ID_KEY);
+  return (await idbGet<string>(DEVICE_ID_KEY)) ?? null;
 }
 
 async function requireOwnDeviceId(): Promise<string> {

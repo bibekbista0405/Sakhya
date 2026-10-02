@@ -75,9 +75,16 @@ router.post("/register", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequ
 
   let deviceId: string;
   if (existing) {
+    if (existing.revokedAt) {
+      // A revoked cryptographic identity is permanently dead. Never resurrect
+      // it just because the browser still has its local Olm pickle. The client
+      // must generate a fresh identity and register that as a new device.
+      res.status(409).json({ error: "This encryption identity has been revoked; create a new device identity" });
+      return;
+    }
     deviceId = existing.id;
     db.prepare(
-      `UPDATE devices SET name = ?, ed25519IdentityKey = ?, fallbackKeyId = ?, fallbackKey = ?, fallbackKeySignature = ?, lastActiveAt = datetime('now'), revokedAt = NULL WHERE id = ?`
+      `UPDATE devices SET name = ?, ed25519IdentityKey = ?, fallbackKeyId = ?, fallbackKey = ?, fallbackKeySignature = ?, lastActiveAt = datetime('now') WHERE id = ?`
     ).run(
       deviceName,
       ed25519IdentityKey,
