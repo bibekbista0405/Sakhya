@@ -49,6 +49,9 @@ const server = http.createServer(app);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
 
 const io = new Server(server, {
+  // Signaling payloads are intentionally small; large WebRTC SDP/ICE blobs
+  // are rejected before they reach the socket handlers.
+  maxHttpBufferSize: 256 * 1024,
   cors: {
     origin: CLIENT_ORIGIN,
     methods: ["GET", "POST"],

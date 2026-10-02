@@ -76,6 +76,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const connectionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isEndingRef = useRef(false);
+  const callStartedAtRef = useRef<number | null>(null);
 
   const resetState = useCallback(() => {
     if (timerRef.current) {
@@ -95,6 +96,7 @@ export function CallProvider({ children }: { children: ReactNode }) {
       localStreamRef.current = null;
     }
     callIdRef.current = null;
+    callStartedAtRef.current = null;
     targetUserIdRef.current = null;
     pendingOfferRef.current = null;
     pendingCandidatesRef.current = [];
@@ -135,12 +137,24 @@ export function CallProvider({ children }: { children: ReactNode }) {
         setRemoteStream(stream);
       };
 
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+          // A transient disconnected state can recover; failed is terminal.
+          if (pc.iceConnectionState === "failed" && !isEndingRef.current && socket && callIdRef.current) {
+            setErrorMessage("The call network connection failed. A TURN server may be required on this network.");
+            socket.emit("end_call", { callId: callIdRef.current });
+            resetState();
+          }
+        }
+      };
+
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === "connected") {
           if (connectionTimeoutRef.current) {
             clearTimeout(connectionTimeoutRef.current);
             connectionTimeoutRef.current = null;
           }
+          callStartedAtRef.current = Date.now();
           setPhase("connected");
           if (!timerRef.current) {
             setDuration(0);
@@ -321,8 +335,12 @@ export function CallProvider({ children }: { children: ReactNode }) {
       offer: RTCSessionDescriptionInit;
       caller: User;
     }) => {
-      // If already in a call, ignore (auto-busy) — a fuller product could auto-decline with a message.
-      if (phase !== "idle") return;
+      // If already in a call, explicitly reject the new call so the caller
+      // does not keep a stale ringing state.
+      if (phase !== "idle" || callIdRef.current) {
+        socket.emit("call_rejected", { callId: data.callId });
+        return;
+      }
       callIdRef.current = data.callId;
       targetUserIdRef.current = data.caller.id;
       pendingOfferRef.current = data.offer;
@@ -343,7 +361,8 @@ export function CallProvider({ children }: { children: ReactNode }) {
       setPhase("calling");
     };
 
-    const onCallRejected = () => {
+    const onCallRejected = (data: { callId: string }) => {
+      if (data?.callId && data.callId !== callIdRef.current) return;
       setErrorMessage("Call was declined");
       resetState();
     };
@@ -367,7 +386,9 @@ export function CallProvider({ children }: { children: ReactNode }) {
       }
     };
 
-    const onCallEnded = () => {
+    const onCallEnded = (data: { callId?: string; reason?: string }) => {
+      if (data?.callId && data.callId !== callIdRef.current) return;
+      if (data?.reason && data.reason !== "No answer") setErrorMessage(data.reason);
       resetState();
     };
 

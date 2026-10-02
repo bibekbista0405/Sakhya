@@ -43,6 +43,43 @@ const activeCalls = new Map<
 
 const ALLOWED_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "😡", "🔥", "👏"];
 
+// WebRTC signaling must never become an unbounded relay. Keep SDP/ICE
+// payloads small and rate-limit signaling independently from chat messages.
+const MAX_SDP_LENGTH = 64 * 1024;
+const MAX_ICE_CANDIDATE_LENGTH = 8 * 1024;
+const CALL_SIGNAL_WINDOW_MS = 10_000;
+const CALL_SIGNAL_MAX = process.env.NODE_ENV === "production" ? 120 : 600;
+const callSignalLog = new Map<string, number[]>();
+
+function isCallSignalRateLimited(userId: string): boolean {
+  const now = Date.now();
+  const timestamps = (callSignalLog.get(userId) ?? []).filter((t) => now - t < CALL_SIGNAL_WINDOW_MS);
+  if (timestamps.length >= CALL_SIGNAL_MAX) {
+    callSignalLog.set(userId, timestamps);
+    return true;
+  }
+  timestamps.push(now);
+  callSignalLog.set(userId, timestamps);
+  return false;
+}
+
+function isValidSdp(offer: RTCSessionDescriptionInit | undefined): boolean {
+  return !!offer &&
+    (offer.type === "offer" || offer.type === "answer") &&
+    typeof offer.sdp === "string" &&
+    offer.sdp.length > 0 &&
+    offer.sdp.length <= MAX_SDP_LENGTH;
+}
+
+function isValidIceCandidate(candidate: RTCIceCandidateInit | undefined): boolean {
+  if (!candidate || typeof candidate !== "object") return false;
+  if (typeof candidate.candidate !== "string" || candidate.candidate.length === 0 || candidate.candidate.length > MAX_ICE_CANDIDATE_LENGTH) return false;
+  if (candidate.sdpMid != null && (typeof candidate.sdpMid !== "string" || candidate.sdpMid.length > 256)) return false;
+  if (candidate.usernameFragment != null && (typeof candidate.usernameFragment !== "string" || candidate.usernameFragment.length > 256)) return false;
+  if (candidate.sdpMLineIndex != null && (!Number.isInteger(candidate.sdpMLineIndex) || candidate.sdpMLineIndex < 0 || candidate.sdpMLineIndex > 255)) return false;
+  return true;
+}
+
 // Socket.IO events bypass Express middleware entirely, so REST rate limiting
 // doesn't cover "send_message". This is a minimal sliding-window limiter keyed
 // per user to blunt message-spam abuse; it intentionally lives in memory since
@@ -564,7 +601,11 @@ export function initSocket(io: Server): void {
 
     socket.on("call_user", (data: { receiverId: string; type: "audio" | "video"; offer: RTCSessionDescriptionInit }) => {
       const { receiverId, type, offer } = data || {};
-      if (!receiverId || !offer || (type !== "audio" && type !== "video")) return;
+      if (!receiverId || !isValidSdp(offer) || (type !== "audio" && type !== "video")) return;
+      if (isCallSignalRateLimited(userId)) {
+        socket.emit("call_failed", { reason: "Too many call signaling requests. Please try again shortly." });
+        return;
+      }
       if (!areFriends(userId, receiverId)) {
         socket.emit("error_message", { error: "You can only call friends" });
         return;
@@ -608,8 +649,9 @@ export function initSocket(io: Server): void {
     });
 
     socket.on("call_accepted", (data: { callId: string; answer: RTCSessionDescriptionInit }) => {
+      if (isCallSignalRateLimited(userId)) return;
       const call = activeCalls.get(data?.callId);
-      if (!call || call.receiverId !== userId || !data?.answer) return;
+      if (!call || call.receiverId !== userId || !isValidSdp(data?.answer) || data.answer.type !== "answer") return;
       // Acceptance only completes the WebRTC handshake. The call is marked
       // connected after RTCPeerConnection reaches the connected state.
       emitToUser(call.callerId, "call_accepted", { callId: data.callId, answer: data.answer });
@@ -635,10 +677,11 @@ export function initSocket(io: Server): void {
     });
 
     socket.on("ice_candidate", (data: { callId: string; candidate: RTCIceCandidateInit; targetId: string }) => {
+      if (isCallSignalRateLimited(userId)) return;
       const call = activeCalls.get(data?.callId);
       if (!call || (call.callerId !== userId && call.receiverId !== userId)) return;
       const targetId = call.callerId === userId ? call.receiverId : call.callerId;
-      if (data?.targetId !== targetId || !data?.candidate) return;
+      if (data?.targetId !== targetId || !isValidIceCandidate(data?.candidate)) return;
       emitToUser(targetId, "ice_candidate", { callId: data.callId, candidate: data.candidate });
     });
 
@@ -687,6 +730,11 @@ export function initSocket(io: Server): void {
 // Expire unanswered calls so stale signaling state cannot block future calls.
 setInterval(() => {
   const now = Date.now();
+  for (const [userId, timestamps] of callSignalLog.entries()) {
+    const fresh = timestamps.filter((t) => now - t < CALL_SIGNAL_WINDOW_MS);
+    if (fresh.length) callSignalLog.set(userId, fresh);
+    else callSignalLog.delete(userId);
+  }
   for (const [callId, call] of activeCalls.entries()) {
     if (!call.connected && now - call.startedAt > 45_000) {
       db.prepare(`UPDATE calls SET status = 'missed', endedAt = datetime('now') WHERE id = ?`).run(callId);
