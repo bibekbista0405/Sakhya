@@ -89,6 +89,26 @@ export async function idbDelete(key: string): Promise<void> {
   });
 }
 
+/** Delete all keys belonging to a namespace/prefix in the active account store. */
+export async function idbDeletePrefix(prefix: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readwrite");
+    const store = tx.objectStore(STORE);
+    const req = store.openCursor();
+    req.onsuccess = () => {
+      const cursor = req.result as IDBCursorWithValue | null;
+      if (!cursor) return;
+      if (typeof cursor.key === "string" && cursor.key.startsWith(prefix)) cursor.delete();
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+    tx.onabort = () => { db.close(); reject(tx.error || new Error("IndexedDB transaction aborted")); };
+  });
+}
+
 /** Wipe only the currently selected account's local key material. */
 export async function idbClearAll(): Promise<void> {
   const db = await openDb();

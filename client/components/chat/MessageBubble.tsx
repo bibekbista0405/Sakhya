@@ -69,13 +69,15 @@ function AttachmentBubble({
     setError(null);
     try {
       const u = await downloadAndDecryptAttachment(meta);
+      // Claim server-side consumption before exposing the decrypted object URL
+      // in the UI. If another tab/device already consumed it, nothing is shown.
+      // The decrypted bytes are necessarily present briefly in memory because
+      // E2EE view-once cannot be enforced against a modified client.
+      await consumeViewOnceAttachment(meta.attachmentId!);
       setUrl(u);
       setRevealed(true);
-      // Only the recipient consumes it; the sender's own bubble never calls
-      // download for a view-once attachment they sent (see ChatWindow — the
-      // sender's copy comes from its own locally-known plaintext, not a
-      // decrypt), so this path only ever runs for the recipient.
-      await consumeViewOnceAttachment(meta.attachmentId!);
+      // Replace the cached attachment metadata with a keyless consumed marker.
+      // This prevents this device from reconstructing the ciphertext later.
       await setCachedPlaintext(messageId, JSON.stringify(toConsumedMetadata(meta)));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not open attachment");

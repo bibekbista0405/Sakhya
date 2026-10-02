@@ -37,7 +37,7 @@ import { MessageBubble } from "@/components/chat/MessageBubble";
 import { encryptForPeer, getOwnDeviceId } from "@/lib/crypto";
 import { encryptAndUploadAttachment } from "@/lib/attachments";
 import { resolveMessagePlaintext, resolveMessageList } from "@/lib/messageDecrypt";
-import { setCachedPlaintext } from "@/lib/messageStore";
+import { setCachedPlaintext, deleteCachedPlaintext } from "@/lib/messageStore";
 import { IdentityKeyChangedError } from "@/lib/trust";
 import { SecurityVerification } from "@/components/chat/SecurityVerification";
 import { ChatLockPrompt } from "@/components/chat/ChatLockPrompt";
@@ -214,6 +214,10 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     const onStopTyping = (data: { senderId: string }) => data.senderId === friendId && setIsTyping(false);
 
     const onMessageExpired = (data: { id: string }) => {
+      // Server expiry is authoritative. Remove both the rendered copy and the
+      // decrypted IndexedDB copy; otherwise reopening this chat could revive
+      // an expired message from local plaintext cache.
+      deleteCachedPlaintext(data.id).catch(() => undefined);
       setMessages((prev) => {
         const next = prev.filter((m) => m.id !== data.id);
         updateCachedMessages(friendId, next);
@@ -227,6 +231,7 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     };
 
     const onMessageHidden = (data: { messageId: string }) => {
+      deleteCachedPlaintext(data.messageId).catch(() => undefined);
       setMessages((prev) => {
         const next = prev.filter((m) => m.id !== data.messageId);
         updateCachedMessages(friendId, next);
@@ -283,8 +288,12 @@ export function ChatWindow({ friendId }: { friendId: string }) {
         // (see lib/utils.ts formatTime for the established pattern), or a
         // browser not in UTC will parse it as local time and remove
         // messages at the wrong moment.
-        const stillValid = prev.filter((m) => !m.expiresAt || new Date(m.expiresAt.replace(" ", "T") + "Z").getTime() > now);
-        if (stillValid.length === prev.length) return prev;
+        const expiredIds = prev
+          .filter((m) => m.expiresAt && new Date(m.expiresAt.replace(" ", "T") + "Z").getTime() <= now)
+          .map((m) => m.id);
+        if (expiredIds.length === 0) return prev;
+        for (const id of expiredIds) deleteCachedPlaintext(id).catch(() => undefined);
+        const stillValid = prev.filter((m) => !expiredIds.includes(m.id));
         updateCachedMessages(friendId, stillValid);
         return stillValid;
       });
@@ -718,6 +727,9 @@ export function ChatWindow({ friendId }: { friendId: string }) {
             setShowSecurity(true);
           }}
           onCleared={() => {
+            // Clear decrypted plaintext for every locally cached message in
+            // this conversation as well as the rendered chat cache.
+            for (const message of messages) deleteCachedPlaintext(message.id).catch(() => undefined);
             setMessages([]);
             updateCachedMessages(friendId, []);
           }}

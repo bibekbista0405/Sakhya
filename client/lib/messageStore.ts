@@ -1,6 +1,6 @@
 "use client";
 
-import { idbGet, idbSet } from "./idb";
+import { idbGet, idbSet, idbDelete, idbDeletePrefix } from "./idb";
 
 /**
  * Caches DECRYPTED plaintext locally, keyed by message id.
@@ -28,4 +28,14 @@ export async function getCachedPlaintext(messageId: string): Promise<string | un
 
 export async function setCachedPlaintext(messageId: string, plaintext: string): Promise<void> {
   await idbSet(key(messageId), plaintext);
+}
+
+/** Permanently remove decrypted plaintext for a message from this account's local store. */
+export async function deleteCachedPlaintext(messageId: string): Promise<void> {
+  await idbDelete(key(messageId));
+}
+
+/** Remove every decrypted message/attachment plaintext cached for this account. */
+export async function clearCachedPlaintext(): Promise<void> {
+  await idbDeletePrefix("sakhya:msg-plaintext:");
 }

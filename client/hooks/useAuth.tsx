@@ -1,5 +1,7 @@
 "use client";
 
+import { clearCachedPlaintext } from "@/lib/messageStore";
+import { clearChatCache } from "@/lib/chatCache";
 import { createContext, useContext, useEffect, useState, ReactNode, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { api, setToken, clearToken, getStoredToken } from "@/lib/api";
@@ -94,6 +96,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // ignore network errors on logout
     }
     closeAllBrowserNotifications();
+    // Logout is a privacy boundary: keep long-lived E2EE identity keys, but
+    // remove decrypted message plaintext and in-memory chat state so a later
+    // account cannot inherit the previous account's readable content.
+    await clearCachedPlaintext().catch(() => undefined);
+    clearChatCache();
     clearActiveCryptoSession();
     clearToken();
     setTokenState(null);

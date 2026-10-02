@@ -27,3 +27,7 @@ export function isChatCacheFresh(friendId: string, maxAge = 30_000): boolean {
   const entry = cache.get(friendId);
   return !!entry && Date.now() - entry.updatedAt < maxAge;
 }
+
+export function clearChatCache(): void {
+  cache.clear();
+}

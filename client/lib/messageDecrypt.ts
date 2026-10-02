@@ -2,7 +2,7 @@
 
 import { Message } from "@/types";
 import { decryptFromPeer, getOwnDeviceId } from "./crypto";
-import { getCachedPlaintext, setCachedPlaintext } from "./messageStore";
+import { getCachedPlaintext, setCachedPlaintext, deleteCachedPlaintext } from "./messageStore";
 
 /**
  * Given a raw Message from the server (which for encrypted messages only
@@ -20,6 +20,10 @@ export async function resolveMessagePlaintext(
   pendingOwnPlaintext?: string
 ): Promise<Message> {
   if (message.deletedAt) {
+    // Delete-for-everyone is a local data-destruction event too. Never leave
+    // the old decrypted plaintext in IndexedDB after the server has marked the
+    // message deleted.
+    await deleteCachedPlaintext(message.id).catch(() => undefined);
     return { ...message, content: "" };
   }
 

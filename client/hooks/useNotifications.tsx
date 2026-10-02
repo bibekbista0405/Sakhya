@@ -8,7 +8,7 @@ import { useChatLock } from "@/hooks/useChatLock";
 import { api } from "@/lib/api";
 import { Notification } from "@/types";
 import { showBrowserNotification } from "@/lib/browserNotifications";
-import { getCachedPlaintext } from "@/lib/messageStore";
+import { getCachedPlaintext, deleteCachedPlaintext } from "@/lib/messageStore";
 import { parseAttachmentMetadata } from "@/lib/attachments";
 
 interface NotificationContextValue {
@@ -67,9 +67,16 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
       setNotifications((prev) => [n, ...prev]);
       showForNotification(n).catch(() => undefined);
     };
+    const onMessageExpired = (data: { id: string }) => {
+      // This provider stays mounted even when no chat is open, so local
+      // plaintext is purged even if the expiry event arrives in the background.
+      deleteCachedPlaintext(data.id).catch(() => undefined);
+    };
     socket.on("notification", onNotification);
+    socket.on("message_expired", onMessageExpired);
     return () => {
       socket.off("notification", onNotification);
+      socket.off("message_expired", onMessageExpired);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket]);
