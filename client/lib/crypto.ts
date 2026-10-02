@@ -1,7 +1,7 @@
 "use client";
 
 import { api, ApiError } from "./api";
-import { idbGet, idbSet, idbClearAll, setIdbUserScope, getIdbUserScope } from "./idb";
+import { idbGet, idbSet, idbDelete, idbClearAll, setIdbUserScope, getIdbUserScope } from "./idb";
 import { checkIdentity, acceptChangedIdentity, IdentityKeyChangedError } from "./trust";
 
 // Loaded lazily so it never touches SSR and never blocks initial page load.
@@ -430,17 +430,34 @@ async function decryptFromPeerLocked(
   olmMessageType: 0 | 1
 ): Promise<{ plaintext: string; securityCodeChanged: boolean }> {
   const Olm = await loadOlm();
-  const existing = await loadSession(peerUserId, senderDeviceId);
+  let existing = await loadSession(peerUserId, senderDeviceId);
 
   if (existing) {
-    const plaintext = existing.session.decrypt(olmMessageType, ciphertext);
-    await persistSession(peerUserId, senderDeviceId, existing.session, existing.theirCurveIdentityKey);
-    existing.session.free();
-    return { plaintext, securityCodeChanged: false };
+    try {
+      const plaintext = existing.session.decrypt(olmMessageType, ciphertext);
+      await persistSession(peerUserId, senderDeviceId, existing.session, existing.theirCurveIdentityKey);
+      existing.session.free();
+      return { plaintext, securityCodeChanged: false };
+    } catch (err) {
+      // A type-0 message is a complete Olm session-establishment message. If
+      // we already have a stored session but that message fails MAC validation,
+      // the stored session is stale (commonly after the sender reinstalled,
+      // cleared storage, or recovered onto a new browser). Keeping the stale
+      // ratchet makes every later message fail too. Safely discard ONLY that
+      // stale session and rebuild from this authenticated type-0 message.
+      if (olmMessageType === 0 && /BAD_MESSAGE_MAC|BAD_MESSAGE_KEY_ID|UNKNOWN_MESSAGE_INDEX/i.test(String(err))) {
+        existing.session.free();
+        await idbDelete(sessionKey(peerUserId, senderDeviceId));
+        existing = null;
+      } else {
+        existing.session.free();
+        throw err;
+      }
+    }
   }
 
   if (olmMessageType !== 0) {
-    throw new Error("No session for this message and it isn't a session-establishing message.");
+    throw new Error("No usable session for this message and it isn't a session-establishing message.");
   }
 
   const account = await loadOrCreateAccount();
@@ -475,6 +492,172 @@ async function decryptFromPeerLocked(
   await persistSession(peerUserId, senderDeviceId, session, senderDevice.curveIdentityKey);
   session.free();
   return { plaintext, securityCodeChanged: trust.changed };
+}
+
+
+export interface EncryptedDecryptItem {
+  messageId: string;
+  peerUserId: string;
+  senderDeviceId: string;
+  ciphertext: string;
+  olmMessageType: 0 | 1;
+}
+
+export interface BatchDecryptResult {
+  plaintext: string;
+  securityCodeChanged: boolean;
+}
+
+/**
+ * Decrypt a chronological history batch without letting an old-history replay
+ * corrupt the live Olm ratchet.  A persistent session may already be ahead of
+ * the requested page (for example after reopening a chat). In that case the
+ * batch may temporarily create a fresh inbound session from a type-0 message,
+ * but it never overwrites the newer persistent session.
+ */
+export async function decryptMessageBatch(
+  items: EncryptedDecryptItem[]
+): Promise<Map<string, BatchDecryptResult | Error>> {
+  if (items.length === 0) return new Map();
+  await ensureDeviceRegistered();
+  return withCryptoLock(async () => {
+    const result = new Map<string, BatchDecryptResult | Error>();
+    const sessions = new Map<string, {
+      session: import("@matrix-org/olm").Session;
+      theirCurveIdentityKey: string;
+      wasPersistent: boolean;
+      replacedPersistent: boolean;
+    }>();
+    const identityCache = new Map<string, Map<string, { curveIdentityKey: string; ed25519IdentityKey: string }>>();
+    const account = await loadOrCreateAccount();
+    const Olm = await loadOlm();
+
+    const getIdentity = async (peerUserId: string, deviceId: string) => {
+      let devices = identityCache.get(peerUserId);
+      if (!devices) {
+        const identities = await getPeerIdentities(peerUserId);
+        devices = new Map(identities.map((d) => [d.deviceId, { curveIdentityKey: d.curveIdentityKey, ed25519IdentityKey: d.ed25519IdentityKey }]));
+        identityCache.set(peerUserId, devices);
+      }
+      const identity = devices.get(deviceId);
+      if (!identity) throw new Error("Could not verify the sender's device identity.");
+      return identity;
+    };
+
+    const sessionKeyFor = (item: EncryptedDecryptItem) => `${item.peerUserId}\u0000${item.senderDeviceId}`;
+
+    try {
+      for (const item of items) {
+        const key = sessionKeyFor(item);
+        let state = sessions.get(key);
+        if (!state) {
+          const loaded = await loadSession(item.peerUserId, item.senderDeviceId);
+          if (loaded) {
+            state = { ...loaded, wasPersistent: true, replacedPersistent: false };
+            sessions.set(key, state);
+          }
+        }
+
+        let plaintext: string | null = null;
+        let securityCodeChanged = false;
+
+        if (state) {
+          try {
+            plaintext = state.session.decrypt(item.olmMessageType, item.ciphertext);
+          } catch (err) {
+            if (item.olmMessageType !== 0) {
+              result.set(item.messageId, err instanceof Error ? err : new Error(String(err)));
+              continue;
+            }
+            // A type-0 message is a new inbound session. Do not destroy the
+            // existing persistent session until the replacement actually
+            // authenticates and decrypts successfully.
+            const identity = await getIdentity(item.peerUserId, item.senderDeviceId);
+            const trust = await checkIdentity(item.peerUserId, {
+              deviceId: item.senderDeviceId,
+              curveIdentityKey: identity.curveIdentityKey,
+              ed25519IdentityKey: identity.ed25519IdentityKey,
+            });
+            if (trust.changed) await acceptChangedIdentity(item.peerUserId, {
+              deviceId: item.senderDeviceId,
+              curveIdentityKey: identity.curveIdentityKey,
+              ed25519IdentityKey: identity.ed25519IdentityKey,
+            });
+            const replacement = new Olm.Session();
+            try {
+              replacement.create_inbound_from(account, identity.curveIdentityKey, item.ciphertext);
+              plaintext = replacement.decrypt(0, item.ciphertext);
+              state.session.free();
+              state = {
+                session: replacement,
+                theirCurveIdentityKey: identity.curveIdentityKey,
+                wasPersistent: true,
+                replacedPersistent: true,
+              };
+              sessions.set(key, state);
+              securityCodeChanged = trust.changed;
+              account.remove_one_time_keys(replacement);
+            } catch (replacementErr) {
+              replacement.free();
+              result.set(item.messageId, replacementErr instanceof Error ? replacementErr : new Error(String(replacementErr)));
+              continue;
+            }
+          }
+        } else if (item.olmMessageType === 0) {
+          const identity = await getIdentity(item.peerUserId, item.senderDeviceId);
+          const trust = await checkIdentity(item.peerUserId, {
+            deviceId: item.senderDeviceId,
+            curveIdentityKey: identity.curveIdentityKey,
+            ed25519IdentityKey: identity.ed25519IdentityKey,
+          });
+          if (trust.changed) await acceptChangedIdentity(item.peerUserId, {
+            deviceId: item.senderDeviceId,
+            curveIdentityKey: identity.curveIdentityKey,
+            ed25519IdentityKey: identity.ed25519IdentityKey,
+          });
+          const inbound = new Olm.Session();
+          try {
+            inbound.create_inbound_from(account, identity.curveIdentityKey, item.ciphertext);
+            plaintext = inbound.decrypt(0, item.ciphertext);
+            account.remove_one_time_keys(inbound);
+            state = {
+              session: inbound,
+              theirCurveIdentityKey: identity.curveIdentityKey,
+              wasPersistent: false,
+              replacedPersistent: false,
+            };
+            sessions.set(key, state);
+            securityCodeChanged = trust.changed;
+          } catch (err) {
+            inbound.free();
+            result.set(item.messageId, err instanceof Error ? err : new Error(String(err)));
+            continue;
+          }
+        } else {
+          result.set(item.messageId, new Error("No usable Olm session for this history message."));
+          continue;
+        }
+
+        if (plaintext !== null) {
+          result.set(item.messageId, { plaintext, securityCodeChanged });
+        }
+      }
+
+      await persistAccount(account);
+      for (const [key, state] of sessions.entries()) {
+        // Never overwrite a newer persistent live session with a replayed
+        // replacement. Otherwise persist the session state reached by this
+        // chronological batch so the next live type-1 message continues from
+        // exactly the same ratchet position.
+        if (state.replacedPersistent) continue;
+        const [peerUserId, senderDeviceId] = key.split("\u0000");
+        await persistSession(peerUserId, senderDeviceId, state.session, state.theirCurveIdentityKey);
+      }
+    } finally {
+      for (const state of sessions.values()) state.session.free();
+    }
+    return result;
+  });
 }
 
 export async function getOwnDeviceId(): Promise<string | null> {

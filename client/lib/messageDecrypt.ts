@@ -1,7 +1,7 @@
 "use client";
 
 import { Message } from "@/types";
-import { decryptFromPeer, getOwnDeviceId } from "./crypto";
+import { decryptFromPeer, decryptMessageBatch, getOwnDeviceId } from "./crypto";
 import { getCachedPlaintext, setCachedPlaintext, deleteCachedPlaintext } from "./messageStore";
 
 /**
@@ -79,20 +79,67 @@ export async function resolveMessagePlaintext(
   }
 }
 
-/** Sequentially resolves a list of messages, preserving order (required — see messageStore.ts). */
+/** Sequentially resolves a list of messages, preserving Olm ratchet order. */
 export async function resolveMessageList(
   messages: Message[],
   selfUserId: string,
   peerUserId: string,
   signal?: AbortSignal
 ): Promise<Message[]> {
-  const resolved: Message[] = [];
+  const resolved = [...messages];
+  const ownDeviceId = await getOwnDeviceId();
+  const work: { index: number; message: Message; peerUserId: string; senderDeviceId: string; ciphertext: string; olmMessageType: 0 | 1 }[] = [];
+
   for (let i = 0; i < messages.length; i += 1) {
     if (signal?.aborted) throw new DOMException("Message decryption cancelled", "AbortError");
-    resolved.push(await resolveMessagePlaintext(messages[i], selfUserId, peerUserId));
-    // Yield between small batches so navigation/input stays responsive while
-    // a large chat history is being decrypted by libolm.
-    if (i % 4 === 3) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const message = messages[i];
+    if (message.deletedAt || !message.isEncrypted) continue;
+    const cached = await getCachedPlaintext(message.id);
+    if (cached !== undefined) {
+      resolved[i] = { ...message, content: cached, decryptError: false };
+      continue;
+    }
+    const envelope = ownDeviceId
+      ? message.encryptedEnvelopes?.find((candidate) => candidate.recipientDeviceId === ownDeviceId)
+      : undefined;
+    const ciphertext = envelope?.ciphertext ?? message.ciphertext;
+    const senderDeviceId = envelope?.senderDeviceId ?? message.senderDeviceId;
+    const olmMessageType = envelope?.olmMessageType ?? message.olmMessageType;
+    if (!ciphertext || !senderDeviceId || (olmMessageType !== 0 && olmMessageType !== 1)) {
+      resolved[i] = { ...message, content: "", decryptError: true };
+      continue;
+    }
+    work.push({
+      index: i,
+      message,
+      peerUserId: message.senderId === selfUserId ? selfUserId : peerUserId,
+      senderDeviceId,
+      ciphertext,
+      olmMessageType,
+    });
+  }
+
+  const batch = await decryptMessageBatch(work.map(({ message, ...item }) => ({ messageId: message.id, ...item })));
+  for (const item of work) {
+    const outcome = batch.get(item.message.id);
+    if (outcome && !(outcome instanceof Error)) {
+      await setCachedPlaintext(item.message.id, outcome.plaintext);
+      resolved[item.index] = {
+        ...item.message,
+        content: outcome.plaintext,
+        decryptError: false,
+        securityCodeChanged: outcome.securityCodeChanged,
+      };
+    } else {
+      // History can legitimately be older than the persisted forward ratchet
+      // on this browser/device. Do not mutate that live session just to replay
+      // an old page; show an explicit unavailable state instead.
+      resolved[item.index] = { ...item.message, content: "", decryptError: true };
+      if (process.env.NODE_ENV !== "production") {
+        console.warn("E2EE history message is unavailable on this device", item.message.id, outcome instanceof Error ? outcome.message : "unknown decrypt failure");
+      }
+    }
   }
   return resolved;
 }
+

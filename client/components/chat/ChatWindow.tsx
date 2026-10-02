@@ -193,6 +193,10 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     const onMessageUpdated = async (msg: Message) => {
       if (!isMessageForChat(msg)) return;
       await historyReadyRef.current;
+      // An edit carries a new Olm ciphertext and must never be satisfied by
+      // the old plaintext cache entry. Remove that cache entry first so the
+      // new ciphertext advances/decrypts the correct ratchet state.
+      if (msg.isEncrypted) await deleteCachedPlaintext(msg.id).catch(() => undefined);
       const resolved = user ? await resolveMessagePlaintext(msg, user.id, friendId) : msg;
       setMessages((prev) => {
         const next = prev.map((m) => (m.id === resolved.id ? resolved : m));
@@ -311,9 +315,12 @@ export function ChatWindow({ friendId }: { friendId: string }) {
       const beforeId = encodeURIComponent(messages[0].id);
       const deviceId = await getOwnDeviceId();
       const res = await api.get<{ messages: Message[]; hasMore: boolean }>(`/messages/${friendId}?limit=100&before=${before}&beforeId=${beforeId}&deviceId=${encodeURIComponent(deviceId ?? "")}`);
+      const olderResolved = user
+        ? await resolveMessageList(res.messages, user.id, friendId)
+        : res.messages;
       setMessages((prev) => {
         const ids = new Set(prev.map((m) => m.id));
-        const next = [...res.messages.filter((m) => !ids.has(m.id)), ...prev];
+        const next = [...olderResolved.filter((m) => !ids.has(m.id)), ...prev];
         updateCachedMessages(friendId, next);
         return next;
       });
@@ -324,7 +331,7 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     } finally {
       setLoadingOlder(false);
     }
-  }, [friendId, hasMore, loadingOlder, messages]);
+  }, [friendId, hasMore, loadingOlder, messages, user]);
 
   const handleChange = useCallback((value: string) => {
     setDraft(value.slice(0, 4000));
