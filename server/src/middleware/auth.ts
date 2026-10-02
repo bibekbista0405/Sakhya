@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import { UAParser } from "ua-parser-js";
 import { AuthPayload } from "../types";
 import { db } from "../db";
@@ -16,6 +17,10 @@ if (isProduction && (!configuredSecret || configuredSecret.length < 32)) {
 }
 
 export const JWT_SECRET = configuredSecret || "dev_secret_change_me_dev_only";
+
+export function hashSessionToken(token: string): string {
+  return crypto.createHash("sha256").update(token, "utf8").digest("hex");
+}
 
 export interface AuthedRequest extends Request {
   user?: AuthPayload;
@@ -46,8 +51,8 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
   }
 
   const session = db
-    .prepare(`SELECT id, expiresAt FROM sessions WHERE token = ? AND userId = ?`)
-    .get(token, payload.userId) as { id: string; expiresAt: string } | undefined;
+    .prepare(`SELECT id, expiresAt FROM sessions WHERE tokenHash = ? AND userId = ?`)
+    .get(hashSessionToken(token), payload.userId) as { id: string; expiresAt: string } | undefined;
 
   if (!session) {
     res.status(401).json({ error: "Session has been revoked" });

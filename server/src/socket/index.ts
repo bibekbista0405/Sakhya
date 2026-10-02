@@ -17,7 +17,7 @@ import {
   muteConversation,
   unmuteConversation,
 } from "../db";
-import { JWT_SECRET } from "../middleware/auth";
+import { JWT_SECRET, hashSessionToken } from "../middleware/auth";
 import { ATTACHMENTS_DIR } from "../routes/attachments";
 import {
   AuthPayload,
@@ -154,8 +154,8 @@ export function initSocket(io: Server): void {
       // Mirror the REST requireAuth check: a valid JWT signature alone isn't
       // enough, the session must still exist (i.e. not logged out / revoked).
       const session = db
-        .prepare(`SELECT id, expiresAt FROM sessions WHERE token = ? AND userId = ?`)
-        .get(token, payload.userId) as { id: string; expiresAt: string } | undefined;
+        .prepare(`SELECT id, expiresAt FROM sessions WHERE tokenHash = ? AND userId = ?`)
+        .get(hashSessionToken(token), payload.userId) as { id: string; expiresAt: string } | undefined;
       if (!session || new Date(session.expiresAt).getTime() < Date.now()) {
         return next(new Error("Session has been revoked"));
       }
@@ -176,12 +176,13 @@ export function initSocket(io: Server): void {
       if (!token || !socket.userId) return next(new Error("Authentication required"));
       try {
         const session = db
-          .prepare(`SELECT id, expiresAt FROM sessions WHERE token = ? AND userId = ?`)
-          .get(token, socket.userId) as { id: string; expiresAt: string } | undefined;
+          .prepare(`SELECT id, expiresAt FROM sessions WHERE tokenHash = ? AND userId = ?`)
+          .get(hashSessionToken(token), socket.userId) as { id: string; expiresAt: string } | undefined;
         if (!session || new Date(session.expiresAt).getTime() < Date.now()) {
           socket.disconnect(true);
           return next(new Error("Session has been revoked"));
         }
+        db.prepare(`UPDATE sessions SET lastActiveAt = datetime('now') WHERE id = ?`).run(session.id);
         next();
       } catch {
         next(new Error("Authentication failed"));

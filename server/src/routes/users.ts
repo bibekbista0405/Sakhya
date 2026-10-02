@@ -84,6 +84,20 @@ router.post("/:id/report", requireAuth, sensitiveSettingsLimiter, (req: AuthedRe
     return;
   }
 
+  if (messageId) {
+    const message = db
+      .prepare(`SELECT senderId, receiverId FROM messages WHERE id = ?`)
+      .get(messageId) as { senderId: string; receiverId: string } | undefined;
+    // A report may reference only a message that actually belongs to the
+    // reporter and the reported account. This prevents using arbitrary
+    // message IDs to create misleading moderation records.
+    if (!message || !((message.senderId === reporterId && message.receiverId === reportedUserId) ||
+      (message.senderId === reportedUserId && message.receiverId === reporterId))) {
+      res.status(400).json({ error: "Invalid message for this report" });
+      return;
+    }
+  }
+
   createReport(reporterId, reportedUserId, reason, messageId);
   res.status(201).json({ success: true });
 });

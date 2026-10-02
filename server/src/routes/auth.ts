@@ -2,7 +2,7 @@ import { Router, Response } from "express";
 import bcrypt from "bcryptjs";
 import { v4 as uuidv4 } from "uuid";
 import { db } from "../db";
-import { signToken, requireAuth, AuthedRequest, describeDevice, clientIp } from "../middleware/auth";
+import { signToken, hashSessionToken, requireAuth, AuthedRequest, describeDevice, clientIp } from "../middleware/auth";
 import { UserRow } from "../types";
 import {
   toPrivateUser,
@@ -25,8 +25,8 @@ function createSession(userId: string, token: string, req: AuthedRequest): void 
   const deviceName = describeDevice(userAgent);
   const ip = clientIp(req);
   db.prepare(
-    `INSERT INTO sessions (id, userId, token, deviceName, userAgent, ip, expiresAt) VALUES (?, ?, ?, ?, ?, ?, ?)`
-  ).run(sessionId, userId, token, deviceName, userAgent, ip, expiresAt);
+    `INSERT INTO sessions (id, userId, tokenHash, deviceName, userAgent, ip, expiresAt) VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(sessionId, userId, hashSessionToken(token), deviceName, userAgent, ip, expiresAt);
 }
 
 router.post("/register", registerLimiter, (req, res: Response) => {

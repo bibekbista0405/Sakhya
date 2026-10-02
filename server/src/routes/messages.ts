@@ -210,6 +210,10 @@ router.get("/:friendId", requireAuth, (req: AuthedRequest, res: Response) => {
 router.post("/:friendId/clear", requireAuth, (req: AuthedRequest, res: Response) => {
   const userId = req.user!.userId;
   const friendId = req.params.friendId;
+  if (!areFriends(userId, friendId)) {
+    res.status(403).json({ error: "You can only clear chats with friends" });
+    return;
+  }
   clearConversationForUser(userId, friendId);
   res.json({ success: true });
 });
@@ -229,6 +233,10 @@ router.post("/:friendId/clear", requireAuth, (req: AuthedRequest, res: Response)
 router.get("/:friendId/media", requireAuth, (req: AuthedRequest, res: Response) => {
   const userId = req.user!.userId;
   const friendId = req.params.friendId;
+  if (!areFriends(userId, friendId)) {
+    res.status(403).json({ error: "You can only view media with friends" });
+    return;
+  }
   const before = typeof req.query.before === "string" ? req.query.before : null;
   const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 60);
 

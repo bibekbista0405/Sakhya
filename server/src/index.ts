@@ -59,7 +59,11 @@ const io = new Server(server, {
   },
 });
 
-app.set("trust proxy", 1);
+const configuredProxyHops = process.env.TRUST_PROXY_HOPS;
+const trustProxy = configuredProxyHops === undefined
+  ? false
+  : Math.max(0, Number.parseInt(configuredProxyHops, 10) || 0);
+app.set("trust proxy", trustProxy);
 app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
 app.disable("x-powered-by");
 app.use(

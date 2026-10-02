@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 import dotenv from "dotenv";
+import crypto from "crypto";
 import { MessageRow } from "../types";
 
 dotenv.config();
@@ -35,7 +36,7 @@ export function initDb(): void {
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY,
       userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      token TEXT UNIQUE NOT NULL,
+      tokenHash TEXT UNIQUE NOT NULL,
       deviceName TEXT NOT NULL DEFAULT 'Unknown device',
       userAgent TEXT NOT NULL DEFAULT '',
       ip TEXT NOT NULL DEFAULT '',
@@ -170,7 +171,6 @@ export function initDb(): void {
   }
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(userId);`);
-  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);`);
 
   // --- Phase 2: E2EE device & key management ---
   // Server stores PUBLIC key material only. Private keys never leave the client.
@@ -216,6 +216,53 @@ export function initDb(): void {
       `ALTER TABLE sessions ADD COLUMN deviceId TEXT REFERENCES devices(id) ON DELETE SET NULL`
     );
   }
+
+  // Phase 5: never persist bearer tokens in plaintext. Older databases used
+  // `token`; migrate those rows to a SHA-256 token hash and rebuild the table
+  // so the plaintext column is physically removed rather than merely ignored.
+  const sessionCols3 = (db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[]).map(
+    (c) => c.name
+  );
+  if (!sessionCols3.includes("tokenHash")) {
+    const hasLegacyToken = sessionCols3.includes("token");
+    const migrateSessions = db.transaction(() => {
+      db.exec(`
+        CREATE TABLE sessions_secure (
+          id TEXT PRIMARY KEY,
+          userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          tokenHash TEXT UNIQUE NOT NULL,
+          deviceName TEXT NOT NULL DEFAULT 'Unknown device',
+          userAgent TEXT NOT NULL DEFAULT '',
+          ip TEXT NOT NULL DEFAULT '',
+          createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+          lastActiveAt TEXT NOT NULL DEFAULT (datetime('now')),
+          expiresAt TEXT NOT NULL,
+          deviceId TEXT REFERENCES devices(id) ON DELETE SET NULL
+        );
+      `);
+      if (hasLegacyToken) {
+        const rows = db.prepare(`SELECT id, userId, token, deviceName, userAgent, ip, createdAt, lastActiveAt, expiresAt, deviceId FROM sessions`).all() as Array<{
+          id: string; userId: string; token: string; deviceName: string; userAgent: string; ip: string;
+          createdAt: string; lastActiveAt: string; expiresAt: string; deviceId?: string | null;
+        }>;
+        const insert = db.prepare(`INSERT INTO sessions_secure
+          (id, userId, tokenHash, deviceName, userAgent, ip, createdAt, lastActiveAt, expiresAt, deviceId)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+        for (const row of rows) {
+          insert.run(
+            row.id, row.userId, crypto.createHash("sha256").update(row.token, "utf8").digest("hex"),
+            row.deviceName, row.userAgent, row.ip, row.createdAt, row.lastActiveAt, row.expiresAt, row.deviceId ?? null
+          );
+        }
+      }
+      db.exec(`DROP TABLE sessions; ALTER TABLE sessions_secure RENAME TO sessions;`);
+      db.exec(`CREATE INDEX idx_sessions_user ON sessions(userId);`);
+      db.exec(`CREATE INDEX idx_sessions_token_hash ON sessions(tokenHash);`);
+    });
+    migrateSessions();
+  }
+
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_token_hash ON sessions(tokenHash);`);
 
   // Mark pre-Phase-2 messages as legacy plaintext so the client can render an
   // honest "not encrypted" indicator instead of silently implying they were
