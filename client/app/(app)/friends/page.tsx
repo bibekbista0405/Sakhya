@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useMemo } from "react";
-import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { Search, Check, X, Clock, MessageCircle, ShieldOff, ShieldCheck, UserX } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { useSocket } from "@/hooks/useSocket";
@@ -12,9 +11,6 @@ import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { ListItemSkeleton } from "@/components/ui/Skeleton";
-import { cn } from "@/lib/utils";
-
-type Tab = "friends" | "requests" | "blocked";
 
 let friendsPageCache: {
   friends: User[];
@@ -28,11 +24,7 @@ const FRIENDS_CACHE_TTL = 30_000;
 
 export default function FriendsPage() {
   const { socket, onlineUserIds } = useSocket();
-  const searchParams = useSearchParams();
-  const [tab, setTab] = useState<Tab>(() => {
-    const t = searchParams.get("tab");
-    return t === "requests" || t === "blocked" ? t : "friends";
-  });
+  const router = useRouter();
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<User[]>([]);
   const [searching, setSearching] = useState(false);
@@ -41,6 +33,7 @@ export default function FriendsPage() {
   const [incoming, setIncoming] = useState<FriendRequest[]>([]);
   const [outgoing, setOutgoing] = useState<FriendRequest[]>([]);
   const [blocked, setBlocked] = useState<User[]>([]);
+  const [busyRequestId, setBusyRequestId] = useState<string | null>(null);
   const [loading, setLoading] = useState(!friendsPageCache);
   const [error, setError] = useState<string | null>(null);
 
@@ -87,13 +80,17 @@ export default function FriendsPage() {
   useEffect(() => {
     if (!socket) return;
     const refresh = () => loadAll();
+    const onFriendAccept = (data: { friend?: User }) => {
+      void loadAll();
+      if (data.friend?.id) router.push(`/chats/${data.friend.id}`);
+    };
     socket.on("friend_request", refresh);
-    socket.on("friend_accept", refresh);
+    socket.on("friend_accept", onFriendAccept);
     return () => {
       socket.off("friend_request", refresh);
-      socket.off("friend_accept", refresh);
+      socket.off("friend_accept", onFriendAccept);
     };
-  }, [socket, loadAll]);
+  }, [socket, loadAll, router]);
 
   useEffect(() => {
     const q = query.trim();
@@ -115,25 +112,44 @@ export default function FriendsPage() {
     return () => clearTimeout(timeout);
   }, [query]);
 
-  const outgoingIds = useMemo(() => new Set(outgoing.map((r) => r.receiverId)), [outgoing]);
-
   async function sendRequest(userId: string) {
+    setError(null);
+    setBusyRequestId(userId);
     try {
       await api.post(`/friends/request/${userId}`);
-      loadAll();
+      await loadAll();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Could not send request");
+    } finally {
+      setBusyRequestId(null);
     }
   }
 
   async function acceptRequest(requestId: string) {
-    await api.post(`/friends/accept/${requestId}`);
-    loadAll();
+    setError(null);
+    setBusyRequestId(requestId);
+    try {
+      const res = await api.post<{ success: boolean; friend: User }>(`/friends/accept/${requestId}`);
+      await loadAll();
+      if (res.friend?.id) router.push(`/chats/${res.friend.id}`);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not accept request");
+    } finally {
+      setBusyRequestId(null);
+    }
   }
 
   async function rejectRequest(requestId: string) {
-    await api.post(`/friends/reject/${requestId}`);
-    loadAll();
+    setError(null);
+    setBusyRequestId(requestId);
+    try {
+      await api.post(`/friends/reject/${requestId}`);
+      await loadAll();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not reject request");
+    } finally {
+      setBusyRequestId(null);
+    }
   }
 
   async function removeFriend(userId: string) {
@@ -152,12 +168,12 @@ export default function FriendsPage() {
   }
 
   const onlineCount = friends.filter((f) => onlineUserIds.has(f.id)).length;
-  const pendingCount = incoming.length;
+  const pendingTotal = incoming.length + outgoing.length;
 
   return (
     <div className="mx-auto flex h-full w-full max-w-2xl flex-1 flex-col">
       <div className="border-b border-border bg-surface p-4">
-        <h1 className="text-lg font-semibold">Friends</h1>
+        <h1 className="text-lg font-semibold">People</h1>
         <p className="text-sm text-muted">
           {friends.length} friends{onlineCount > 0 ? ` · ${onlineCount} online` : ""}
         </p>
@@ -166,195 +182,164 @@ export default function FriendsPage() {
           <Input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search by username to add a friend"
+            placeholder="Search people by username"
             className="pl-9"
           />
         </div>
       </div>
 
-      {query.trim() ? (
-        <div className="flex-1 overflow-y-auto p-2">
-          {searching && (
-            <div className="flex flex-col gap-1 p-2">
-              <ListItemSkeleton />
-              <ListItemSkeleton />
-            </div>
-          )}
-          {!searching && searchResults.length === 0 && (
-            <EmptyState icon={Search} title="No users found" description="Try a different username." />
-          )}
-          {!searching &&
-            searchResults.map((u) => (
-              <div key={u.id} className="flex items-center gap-3 rounded-lg p-2.5 hover:bg-surface-hover">
-                <Avatar src={u.avatar} name={u.username} size={40} online={u.online} />
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium">{u.username}</p>
-                  {(u.firstName || u.lastName) && (
-                    <p className="truncate text-xs text-muted">
-                      {u.firstName} {u.lastName}
-                    </p>
-                  )}
-                </div>
-                {outgoingIds.has(u.id) ? (
-                  <span className="flex items-center gap-1 text-xs text-muted">
-                    <Clock size={14} /> Pending
-                  </span>
-                ) : (
-                  <Button size="sm" onClick={() => sendRequest(u.id)}>
-                    Add
-                  </Button>
-                )}
-              </div>
-            ))}
-        </div>
-      ) : (
-        <>
-          <div className="flex border-b border-border bg-surface px-2">
-            {(["friends", "requests", "blocked"] as Tab[]).map((t) => (
-              <button
-                key={t}
-                onClick={() => setTab(t)}
-                className={cn(
-                  "relative flex-1 py-3 text-sm font-medium capitalize transition-colors",
-                  tab === t ? "text-accent" : "text-muted hover:text-foreground"
-                )}
-              >
-                {t}
-                {t === "requests" && pendingCount > 0 && (
-                  <span className="ml-1.5 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-danger px-1 text-[10px] font-semibold text-white">
-                    {pendingCount}
-                  </span>
-                )}
-                {tab === t && <span className="absolute inset-x-3 -bottom-px h-0.5 rounded-full bg-accent" />}
-              </button>
-            ))}
-          </div>
+      <div className="flex-1 overflow-y-auto p-2">
+        {error && <p className="mb-2 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">{error}</p>}
 
-          <div className="flex-1 overflow-y-auto p-2">
-            {error && <p className="p-2 text-sm text-danger">{error}</p>}
-
-            {loading && (
+        {query.trim() ? (
+          <section>
+            <div className="mb-2 px-2 pt-1 text-xs font-semibold uppercase tracking-wide text-muted">People</div>
+            {searching && (
               <div className="flex flex-col gap-1 p-2">
                 <ListItemSkeleton />
                 <ListItemSkeleton />
-                <ListItemSkeleton />
               </div>
             )}
-
-            {!loading && tab === "friends" && friends.length === 0 && (
-              <EmptyState
-                icon={UserX}
-                title="No friends yet"
-                description="Search a username above to send your first friend request."
-              />
+            {!searching && searchResults.length === 0 && (
+              <EmptyState icon={Search} title="No users found" description="Try a different username." />
             )}
-            {!loading &&
-              tab === "friends" &&
-              friends.map((f) => (
-                <div key={f.id} className="flex items-center gap-3 rounded-lg p-2.5 hover:bg-surface-hover">
-                  <Avatar src={f.avatar} name={f.username} size={44} online={onlineUserIds.has(f.id)} />
+            {!searching && searchResults.map((u) => {
+              const incomingRequest = incoming.find((r) => r.senderId === u.id);
+              const outgoingRequest = outgoing.find((r) => r.receiverId === u.id);
+              const isFriend = friends.some((f) => f.id === u.id);
+              return (
+                <div key={u.id} className="flex items-center gap-3 rounded-xl p-2.5 hover:bg-surface-hover">
+                  <Avatar src={u.avatar} name={u.username} size={44} online={u.online} />
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium">{f.username}</p>
-                    <p className="truncate text-xs text-muted">
-                      {onlineUserIds.has(f.id) ? "Online" : "Offline"}
-                    </p>
+                    <p className="truncate text-sm font-medium">{u.username}</p>
+                    {(u.firstName || u.lastName) && <p className="truncate text-xs text-muted">{u.firstName} {u.lastName}</p>}
                   </div>
-                  <Link
-                    href={`/chats/${f.id}`}
-                    aria-label={`Message ${f.username}`}
-                    className="flex h-9 w-9 items-center justify-center rounded-full text-accent hover:bg-accent-soft"
-                  >
-                    <MessageCircle size={18} />
-                  </Link>
-                  <button
-                    onClick={() => blockUser(f.id)}
-                    aria-label={`Block ${f.username}`}
-                    className="flex h-9 w-9 items-center justify-center rounded-full text-muted hover:bg-danger-soft hover:text-danger"
-                  >
-                    <ShieldOff size={17} />
-                  </button>
-                  <button
-                    onClick={() => removeFriend(f.id)}
-                    aria-label={`Remove ${f.username}`}
-                    className="flex h-9 w-9 items-center justify-center rounded-full text-muted hover:bg-danger-soft hover:text-danger"
-                  >
-                    <X size={18} />
-                  </button>
+                  {isFriend ? (
+                    <Button size="sm" variant="outline" onClick={() => router.push(`/chats/${u.id}`)}>
+                      <MessageCircle size={15} /> Chat
+                    </Button>
+                  ) : incomingRequest ? (
+                    <div className="flex gap-1.5">
+                      <Button size="sm" onClick={() => acceptRequest(incomingRequest.id)} disabled={busyRequestId === incomingRequest.id}>Accept</Button>
+                      <Button size="sm" variant="outline" onClick={() => rejectRequest(incomingRequest.id)} disabled={busyRequestId === incomingRequest.id}>Decline</Button>
+                    </div>
+                  ) : outgoingRequest ? (
+                    <span className="flex items-center gap-1 text-xs text-muted"><Clock size={14} /> Pending</span>
+                  ) : (
+                    <Button size="sm" onClick={() => sendRequest(u.id)} disabled={busyRequestId === u.id}>
+                      {busyRequestId === u.id ? "Sending…" : "Add"}
+                    </Button>
+                  )}
                 </div>
-              ))}
-
-            {!loading && tab === "requests" && incoming.length === 0 && outgoing.length === 0 && (
-              <EmptyState icon={Clock} title="No pending requests" description="You're all caught up." />
-            )}
-            {!loading && tab === "requests" && (
-              <div className="flex flex-col gap-4">
-                {incoming.length > 0 && (
+              );
+            })}
+          </section>
+        ) : (
+          <>
+            {incoming.length > 0 && (
+              <section className="mb-5">
+                <div className="mb-1 flex items-center justify-between px-2">
                   <div>
-                    <h3 className="mb-1 px-2 text-xs font-semibold uppercase tracking-wide text-muted">
-                      Incoming
-                    </h3>
-                    {incoming.map((r) => (
-                      <div key={r.id} className="flex items-center gap-3 rounded-lg p-2.5 hover:bg-surface-hover">
-                        <Avatar src={r.avatar} name={r.username} size={40} />
-                        <span className="flex-1 truncate text-sm font-medium">{r.username}</span>
-                        <button
-                          onClick={() => acceptRequest(r.id)}
-                          aria-label={`Accept ${r.username}`}
-                          className="flex h-9 w-9 items-center justify-center rounded-full bg-success-soft text-success hover:opacity-80"
-                        >
-                          <Check size={17} />
-                        </button>
-                        <button
-                          onClick={() => rejectRequest(r.id)}
-                          aria-label={`Reject ${r.username}`}
-                          className="flex h-9 w-9 items-center justify-center rounded-full bg-danger-soft text-danger hover:opacity-80"
-                        >
-                          <X size={17} />
-                        </button>
-                      </div>
-                    ))}
+                    <h2 className="text-sm font-semibold">Friend requests</h2>
+                    <p className="text-xs text-muted">People who want to connect with you</p>
                   </div>
-                )}
-                {outgoing.length > 0 && (
-                  <div>
-                    <h3 className="mb-1 px-2 text-xs font-semibold uppercase tracking-wide text-muted">
-                      Sent
-                    </h3>
-                    {outgoing.map((r) => (
-                      <div key={r.id} className="flex items-center gap-3 rounded-lg p-2.5">
-                        <Avatar src={r.avatar} name={r.username} size={40} />
-                        <span className="flex-1 truncate text-sm font-medium">{r.username}</span>
-                        <span className="flex items-center gap-1 text-xs text-muted">
-                          <Clock size={14} /> Pending
-                        </span>
+                  <span className="rounded-full bg-accent-soft px-2 py-0.5 text-xs font-semibold text-accent">{incoming.length}</span>
+                </div>
+                <div className="overflow-hidden rounded-xl border border-border bg-surface">
+                  {incoming.map((r) => (
+                    <div key={r.id} className="flex items-center gap-3 border-b border-border last:border-b-0 p-3">
+                      <Avatar src={r.avatar} name={r.username} size={44} />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium">{r.username}</p>
+                        <p className="text-xs text-muted">Wants to be your friend</p>
                       </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                      <Button size="sm" onClick={() => acceptRequest(r.id)} disabled={busyRequestId === r.id}>
+                        <Check size={15} /> Accept
+                      </Button>
+                      <button onClick={() => rejectRequest(r.id)} disabled={busyRequestId === r.id} className="flex h-9 w-9 items-center justify-center rounded-full text-muted hover:bg-danger-soft hover:text-danger" aria-label={`Decline ${r.username}`}>
+                        <X size={17} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </section>
             )}
 
-            {!loading && tab === "blocked" && blocked.length === 0 && (
-              <EmptyState
-                icon={ShieldCheck}
-                title="No blocked users"
-                description="People you block won't be able to message or call you."
-              />
-            )}
-            {!loading &&
-              tab === "blocked" &&
-              blocked.map((u) => (
-                <div key={u.id} className="flex items-center gap-3 rounded-lg p-2.5 hover:bg-surface-hover">
-                  <Avatar src={u.avatar} name={u.username} size={40} />
-                  <span className="flex-1 truncate text-sm font-medium">{u.username}</span>
-                  <Button size="sm" variant="outline" onClick={() => unblockUser(u.id)}>
-                    Unblock
-                  </Button>
+            {outgoing.length > 0 && (
+              <section className="mb-5">
+                <div className="mb-1 px-2">
+                  <h2 className="text-sm font-semibold">Sent requests</h2>
+                  <p className="text-xs text-muted">Waiting for them to accept</p>
                 </div>
-              ))}
-          </div>
-        </>
-      )}
+                <div className="overflow-hidden rounded-xl border border-border bg-surface">
+                  {outgoing.map((r) => (
+                    <div key={r.id} className="flex items-center gap-3 border-b border-border last:border-b-0 p-3">
+                      <Avatar src={r.avatar} name={r.username} size={44} />
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{r.username}</span>
+                      <span className="flex items-center gap-1 text-xs text-muted"><Clock size={14} /> Pending</span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {loading && (
+              <div className="flex flex-col gap-1 p-2"><ListItemSkeleton /><ListItemSkeleton /><ListItemSkeleton /></div>
+            )}
+
+            {!loading && friends.length === 0 && pendingTotal === 0 && (
+              <EmptyState icon={UserX} title="No friends yet" description="Search above to find people and start a conversation." />
+            )}
+
+            {!loading && friends.length > 0 && (
+              <section>
+                <div className="mb-1 px-2">
+                  <h2 className="text-sm font-semibold">Your friends</h2>
+                  <p className="text-xs text-muted">Tap Chat to start a conversation</p>
+                </div>
+                <div className="overflow-hidden rounded-xl border border-border bg-surface">
+                  {friends.map((f) => (
+                    <div key={f.id} className="flex items-center gap-3 border-b border-border last:border-b-0 p-3 hover:bg-surface-hover">
+                      <Avatar src={f.avatar} name={f.username} size={44} online={onlineUserIds.has(f.id)} />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium">{f.username}</p>
+                        <p className="truncate text-xs text-muted">{onlineUserIds.has(f.id) ? "Online" : "Offline"}</p>
+                      </div>
+                      <Button size="sm" onClick={() => router.push(`/chats/${f.id}`)}>
+                        <MessageCircle size={15} /> Chat
+                      </Button>
+                      <button onClick={() => blockUser(f.id)} aria-label={`Block ${f.username}`} className="hidden h-9 w-9 items-center justify-center rounded-full text-muted hover:bg-danger-soft hover:text-danger sm:flex">
+                        <ShieldOff size={17} />
+                      </button>
+                      <button onClick={() => removeFriend(f.id)} aria-label={`Remove ${f.username}`} className="hidden h-9 w-9 items-center justify-center rounded-full text-muted hover:bg-danger-soft hover:text-danger sm:flex">
+                        <X size={18} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {!loading && blocked.length > 0 && (
+              <section className="mt-5">
+                <div className="px-2">
+                  <h2 className="text-sm font-semibold">Blocked</h2>
+                  <p className="text-xs text-muted">Manage blocked people in Settings.</p>
+                </div>
+                <div className="mt-2 overflow-hidden rounded-xl border border-border bg-surface">
+                  {blocked.map((u) => (
+                    <div key={u.id} className="flex items-center gap-3 border-b border-border last:border-b-0 p-3">
+                      <Avatar src={u.avatar} name={u.username} size={40} />
+                      <span className="min-w-0 flex-1 truncate text-sm font-medium">{u.username}</span>
+                      <Button size="sm" variant="outline" onClick={() => unblockUser(u.id)}>Unblock</Button>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }

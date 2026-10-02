@@ -146,7 +146,7 @@ router.post("/accept/:requestId", requireAuth, (req: AuthedRequest, res: Respons
   });
   emitToUser(request.senderId, "notification", notif);
 
-  res.json({ success: true });
+  res.json({ success: true, friend: toPublicUser(accepter) });
 });
 
 router.post("/reject/:requestId", requireAuth, (req: AuthedRequest, res: Response) => {
