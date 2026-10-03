@@ -288,8 +288,6 @@ router.get("/identity/:userId", requireAuth, (req: AuthedRequest, res: Response)
   res.json({ userId: targetUserId, devices: devices.map(toPublicDevice) });
 });
 
-db.prepare(`DELETE FROM device_pairings WHERE datetime(expiresAt) < datetime('now')`).run();
-
 /** List the current account's own registered devices (crypto identity, not just login sessions). */
 router.get("/", requireAuth, (req: AuthedRequest, res: Response) => {
   const rows = db

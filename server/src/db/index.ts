@@ -234,6 +234,11 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_device_pairings_expiry ON device_pairings(expiresAt);
   `);
 
+  // Remove expired pairing requests after the pairing table has been created.
+  // This must run during DB initialization because route modules are evaluated
+  // before index.ts reaches initDb() at runtime.
+  db.prepare(`DELETE FROM device_pairings WHERE datetime(expiresAt) < datetime('now')`).run();
+
   // Link an auth session to the E2EE device it authenticated for, so revoking a
   // device (Settings → Devices) can also revoke its login session and vice versa.
   const sessionCols2 = (db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[]).map(
