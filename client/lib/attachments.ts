@@ -35,6 +35,8 @@ export interface AttachmentMetadata {
   viewOnce?: boolean;
   /** True once this view-once attachment has been viewed (locally overwritten; see messageDecrypt usage). */
   consumed?: boolean;
+  voiceMessage?: boolean;
+  durationMs?: number;
 }
 
 function toBase64(bytes: Uint8Array): string {

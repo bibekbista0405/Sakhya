@@ -159,7 +159,16 @@ function AttachmentBubble({
     );
   }
   if (isAudio) {
-    return url ? <audio src={url} controls className="w-full" /> : <Loader2 size={16} className="animate-spin" />;
+    const durationSeconds = meta.durationMs ? Math.max(1, Math.round(meta.durationMs / 1000)) : null;
+    const durationLabel = durationSeconds !== null
+      ? `${Math.floor(durationSeconds / 60)}:${String(durationSeconds % 60).padStart(2, "0")}`
+      : null;
+    return url ? (
+      <div className="min-w-[220px] space-y-1">
+        {meta.voiceMessage && <p className={cn("text-[11px] font-medium", isOwn ? "text-white/70" : "text-muted")}>Voice message{durationLabel ? ` • ${durationLabel}` : ""}</p>}
+        <audio src={url} controls preload="metadata" className="w-full" />
+      </div>
+    ) : <Loader2 size={16} className="animate-spin" />;
   }
 
   return (

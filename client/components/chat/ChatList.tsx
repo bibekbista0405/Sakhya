@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useMemo, memo } from "react";
 import { FastNavLink } from "@/components/layout/FastNavLink";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { UserPlus, Search, MessageCircle, Lock } from "lucide-react";
 import { api } from "@/lib/api";
 import { useSocket } from "@/hooks/useSocket";
@@ -69,6 +69,7 @@ export function ChatList() {
   const { socket, onlineUserIds } = useSocket();
   const chatLock = useChatLock();
   const params = useParams<{ friendId?: string }>();
+  const router = useRouter();
   const activeFriendId = params?.friendId;
   const [showLockedUnlock, setShowLockedUnlock] = useState(false);
 
@@ -136,7 +137,10 @@ export function ChatList() {
       );
     };
 
-    const onFriendAccept = () => loadConversations();
+    const onFriendAccept = (data: { friend?: { id?: string } }) => {
+      void loadConversations();
+      if (data.friend?.id) router.push(`/chats/${data.friend.id}`);
+    };
 
     socket.on("receive_message", onReceive);
     socket.on("message_seen", onSeenByFriend);
@@ -146,7 +150,7 @@ export function ChatList() {
       socket.off("message_seen", onSeenByFriend);
       socket.off("friend_accept", onFriendAccept);
     };
-  }, [socket, loadConversations, activeFriendId]);
+  }, [socket, loadConversations, activeFriendId, router]);
 
   // Clear unread badge instantly when navigating into a conversation
   useEffect(() => {

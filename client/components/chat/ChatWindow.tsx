@@ -21,6 +21,8 @@ import {
   Check,
   Eye,
   Lock as LockIcon,
+  Mic,
+  Square,
 } from "lucide-react";
 import { FastNavLink } from "@/components/layout/FastNavLink";
 import { api, ApiError } from "@/lib/api";
@@ -83,6 +85,14 @@ export function ChatWindow({ friendId }: { friendId: string }) {
   const [showUnlockPrompt, setShowUnlockPrompt] = useState(false);
   const [showChatInfo, setShowChatInfo] = useState(false);
   const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [recordingVoice, setRecordingVoice] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingStartedAtRef = useRef<number | null>(null);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const discardRecordingRef = useRef(false);
+  const MAX_VOICE_SECONDS = 5 * 60;
   const [viewOnceArmed, setViewOnceArmed] = useState(false);
   const [disappearingSeconds, setDisappearingSeconds] = useState(0);
   const [showDisappearingMenu, setShowDisappearingMenu] = useState(false);
@@ -333,6 +343,16 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     }
   }, [friendId, hasMore, loadingOlder, messages, user]);
 
+  useEffect(() => () => {
+    discardRecordingRef.current = true;
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") recorder.stop();
+    mediaRecorderRef.current = null;
+    if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+    recordingTimerRef.current = null;
+    recordingChunksRef.current = [];
+  }, []);
+
   const handleChange = useCallback((value: string) => {
     setDraft(value.slice(0, 4000));
     if (!socket) return;
@@ -384,20 +404,17 @@ export function ChatWindow({ friendId }: { friendId: string }) {
     }
   }, [draft, socket, editing, friendId, replyTo, user]);
 
-  const handleAttach = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // allow re-selecting the same file later
-    if (!file || !socket) return;
-
-    const viewOnce = viewOnceArmed;
-    setViewOnceArmed(false);
+  const sendEncryptedAttachment = useCallback(async (file: File, viewOnce: boolean, attachmentMetaOverrides?: Partial<{ voiceMessage: boolean; durationMs: number }>) => {
+    if (!socket) return;
     setUploadingAttachment(true);
     setError(null);
     try {
       const meta = await encryptAndUploadAttachment(file, friendId, viewOnce);
-      const encrypted = await encryptForPeer(friendId, JSON.stringify(meta));
+      const enrichedMeta = { ...meta, ...attachmentMetaOverrides };
+      const plaintextMeta = JSON.stringify(enrichedMeta);
+      const encrypted = await encryptForPeer(friendId, plaintextMeta);
       const clientMessageId = crypto.randomUUID();
-      pendingOutgoingRef.current.set(clientMessageId, JSON.stringify(meta));
+      pendingOutgoingRef.current.set(clientMessageId, plaintextMeta);
       socket.emit("send_message", {
         receiverId: friendId,
         replyToId: replyTo?.id ?? null,
@@ -413,10 +430,112 @@ export function ChatWindow({ friendId }: { friendId: string }) {
       } else {
         setError(err instanceof Error ? err.message : "Could not send attachment");
       }
+      throw err;
     } finally {
       setUploadingAttachment(false);
     }
-  }, [socket, friendId, replyTo, viewOnceArmed]);
+  }, [socket, friendId, replyTo]);
+
+  const stopVoiceRecording = useCallback((discard = false) => {
+    const recorder = mediaRecorderRef.current;
+    discardRecordingRef.current = discard;
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    } else {
+      recordingStartedAtRef.current = null;
+      recordingChunksRef.current = [];
+      setRecordingVoice(false);
+      setRecordingSeconds(0);
+    }
+  }, []);
+
+  const startVoiceRecording = useCallback(async () => {
+    if (!socket || recordingVoice || uploadingAttachment || editing) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setError("Voice recording is not supported by this browser.");
+      return;
+    }
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeCandidates = [
+        "audio/webm;codecs=opus",
+        "audio/webm",
+        "audio/ogg;codecs=opus",
+      ];
+      const mimeType = mimeCandidates.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+      recordingChunksRef.current = [];
+      recordingStartedAtRef.current = Date.now();
+      setRecordingSeconds(0);
+      setRecordingVoice(true);
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) recordingChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        stream.getTracks().forEach((track) => track.stop());
+        setError("Voice recording failed. Please try again.");
+        stopVoiceRecording(true);
+      };
+      recorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const chunks = recordingChunksRef.current;
+        recordingChunksRef.current = [];
+        const durationMs = Math.max(500, Date.now() - (recordingStartedAtRef.current ?? Date.now()));
+        const discard = discardRecordingRef.current;
+        discardRecordingRef.current = false;
+        recordingStartedAtRef.current = null;
+        mediaRecorderRef.current = null;
+        setRecordingVoice(false);
+        if (recordingTimerRef.current) {
+          clearInterval(recordingTimerRef.current);
+          recordingTimerRef.current = null;
+        }
+        setRecordingSeconds(0);
+        if (discard || !chunks.length) return;
+        const type = recorder.mimeType || "audio/webm";
+        const extension = type.includes("ogg") ? "ogg" : "webm";
+        const file = new File([new Blob(chunks, { type })], `voice-${Date.now()}.${extension}`, { type });
+        try {
+          await sendEncryptedAttachment(file, false, { voiceMessage: true, durationMs });
+        } catch {
+          // sendEncryptedAttachment already surfaces the user-facing error.
+        }
+      };
+      recorder.start(250);
+      recordingTimerRef.current = setInterval(() => {
+        const started = recordingStartedAtRef.current;
+        if (started) {
+          const elapsed = Math.floor((Date.now() - started) / 1000);
+          setRecordingSeconds(elapsed);
+          if (elapsed >= MAX_VOICE_SECONDS) stopVoiceRecording(false);
+        }
+      }, 250);
+    } catch (err) {
+      setError(err instanceof DOMException && err.name === "NotAllowedError" ? "Microphone permission was denied." : "Could not access the microphone.");
+      setRecordingVoice(false);
+    }
+  }, [socket, recordingVoice, uploadingAttachment, editing, sendEncryptedAttachment, stopVoiceRecording]);
+
+  const handleAttach = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file || !socket) return;
+
+    const viewOnce = viewOnceArmed;
+    setViewOnceArmed(false);
+    try {
+      await sendEncryptedAttachment(file, viewOnce);
+    } catch {
+      // sendEncryptedAttachment already surfaces the user-facing error.
+    }
+  }, [socket, viewOnceArmed, sendEncryptedAttachment]);
 
   const insertEmoji = useCallback((emoji: string) => {
     setDraft((prev) => `${prev}${emoji}`.slice(0, 4000));
@@ -703,8 +822,26 @@ export function ChatWindow({ friendId }: { friendId: string }) {
         >
           <Eye size={19} />
         </button>
-        <textarea ref={inputRef} value={draft} onChange={(e) => handleChange(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }} rows={1} placeholder={editing ? "Edit message" : "Type a message"} aria-label="Message" className="max-h-32 min-h-11 flex-1 resize-none rounded-2xl border border-border bg-background px-4 py-3 text-[15px] leading-5 outline-none focus:ring-2 focus:ring-accent/40" />
-        <Button type="submit" size="icon" disabled={!draft.trim()} aria-label={editing ? "Save message" : "Send message"}><Send size={18} /></Button>
+        {recordingVoice ? (
+          <div className="flex min-w-0 flex-1 items-center gap-3 rounded-2xl border border-danger/30 bg-danger/5 px-3 py-2.5" role="status" aria-live="polite">
+            <span className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-danger" />
+            <span className="text-sm font-medium">Recording {String(Math.floor(recordingSeconds / 60)).padStart(2, "0")}:{String(recordingSeconds % 60).padStart(2, "0")}</span>
+            <button type="button" onClick={() => stopVoiceRecording(false)} className="ml-auto flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-danger text-white" aria-label="Stop and send voice message" title="Stop and send">
+              <Square size={15} fill="currentColor" />
+            </button>
+            <button type="button" onClick={() => stopVoiceRecording(true)} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-muted hover:bg-surface-hover" aria-label="Cancel voice recording" title="Cancel recording">
+              <X size={18} />
+            </button>
+          </div>
+        ) : (
+          <>
+            <button type="button" onClick={startVoiceRecording} disabled={uploadingAttachment || !!editing} className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-muted hover:bg-surface-hover hover:text-foreground disabled:opacity-50" aria-label="Record voice message" title="Voice message">
+              <Mic size={19} />
+            </button>
+            <textarea ref={inputRef} value={draft} onChange={(e) => handleChange(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }} rows={1} placeholder={editing ? "Edit message" : "Type a message"} aria-label="Message" className="max-h-32 min-h-11 flex-1 resize-none rounded-2xl border border-border bg-background px-4 py-3 text-[15px] leading-5 outline-none focus:ring-2 focus:ring-accent/40" />
+            <Button type="submit" size="icon" disabled={!draft.trim()} aria-label={editing ? "Save message" : "Send message"}><Send size={18} /></Button>
+          </>
+        )}
       </form>
 
       {showSecurity && (
