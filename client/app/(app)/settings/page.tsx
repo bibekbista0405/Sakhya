@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import { ChatLockSettings } from "@/components/settings/ChatLockSettings";
 import { getNotificationPermission, requestNotificationPermission } from "@/lib/browserNotifications";
 import { Bell } from "lucide-react";
+import { DeviceSecuritySettings } from "@/components/settings/DeviceSecuritySettings";
 
 const THEME_OPTIONS: { value: ThemeMode; label: string; icon: typeof Sun }[] = [
   { value: "light", label: "Light", icon: Sun },
@@ -310,6 +311,9 @@ export default function SettingsPage() {
           </div>
         )}
       </section>
+
+      {/* Phase 10: encrypted device management */}
+      <DeviceSecuritySettings />
 
       {/* Starred messages */}
       <Link

@@ -39,7 +39,15 @@ interface AuthedSocket extends Socket {
 
 const activeCalls = new Map<
   string,
-  { callerId: string; receiverId: string; type: "audio" | "video"; startedAt: number; connected: boolean }
+  {
+    callerId: string;
+    receiverId: string;
+    type: "audio" | "video";
+    startedAt: number;
+    connected: boolean;
+    callerSocketId: string;
+    receiverSocketId: string | null;
+  }
 >();
 
 const ALLOWED_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "😡", "🔥", "👏"];
@@ -615,7 +623,7 @@ export function initSocket(io: Server): void {
 
     socket.on("call_user", (data: { receiverId: string; type: "audio" | "video"; offer: RTCSessionDescriptionInit }) => {
       const { receiverId, type, offer } = data || {};
-      if (!receiverId || !isValidSdp(offer) || (type !== "audio" && type !== "video")) return;
+      if (!receiverId || !isValidSdp(offer) || offer.type !== "offer" || (type !== "audio" && type !== "video")) return;
       if (isCallSignalRateLimited(userId)) {
         socket.emit("call_failed", { reason: "Too many call signaling requests. Please try again shortly." });
         return;
@@ -650,7 +658,15 @@ export function initSocket(io: Server): void {
       }
 
       const callId = uuidv4();
-      activeCalls.set(callId, { callerId: userId, receiverId, type, startedAt: Date.now(), connected: false });
+      activeCalls.set(callId, {
+        callerId: userId,
+        receiverId,
+        type,
+        startedAt: Date.now(),
+        connected: false,
+        callerSocketId: socket.id,
+        receiverSocketId: null,
+      });
       db.prepare(`INSERT INTO calls (id, callerId, receiverId, type, status, duration) VALUES (?, ?, ?, ?, 'missed', 0)`).run(
         callId, userId, receiverId, type
       );
@@ -666,6 +682,10 @@ export function initSocket(io: Server): void {
       if (isCallSignalRateLimited(userId)) return;
       const call = activeCalls.get(data?.callId);
       if (!call || call.receiverId !== userId || !isValidSdp(data?.answer) || data.answer.type !== "answer") return;
+      // Bind the call to the socket that actually accepted it. This prevents
+      // an unrelated device/tab for the same account from later terminating
+      // the active call when that other socket disconnects.
+      call.receiverSocketId = socket.id;
       // Acceptance only completes the WebRTC handshake. The call is marked
       // connected after RTCPeerConnection reaches the connected state.
       emitToUser(call.callerId, "call_accepted", { callId: data.callId, answer: data.answer });
@@ -724,18 +744,24 @@ export function initSocket(io: Server): void {
           onlineUsers.delete(userId);
           updateLastSeen(userId);
           broadcastPresence(userId, false);
-          for (const [callId, call] of activeCalls.entries()) {
-            if (call.callerId === userId || call.receiverId === userId) {
-              const otherId = call.callerId === userId ? call.receiverId : call.callerId;
-              const durationSec = call.connected ? Math.round((Date.now() - call.startedAt) / 1000) : 0;
-              db.prepare(`UPDATE calls SET status = ?, duration = ?, endedAt = datetime('now') WHERE id = ?`).run(
-                call.connected ? "completed" : "outgoing_cancelled", durationSec, callId
-              );
-              emitToUser(otherId, "call_ended", { callId, duration: durationSec });
-              activeCalls.delete(callId);
-            }
-          }
         }
+      }
+
+      // A call belongs to the exact socket that owns its WebRTC peer. Do not
+      // tear it down merely because another device/tab for the same account
+      // disconnected. Before the callee accepts, no receiver socket is bound.
+      for (const [callId, call] of activeCalls.entries()) {
+        const ownsCallSocket = call.callerSocketId === socket.id || call.receiverSocketId === socket.id;
+        if (!ownsCallSocket) continue;
+
+        const otherId = call.callerId === userId ? call.receiverId : call.callerId;
+        const durationSec = call.connected ? Math.round((Date.now() - call.startedAt) / 1000) : 0;
+        const finalStatus = call.connected ? "completed" : "outgoing_cancelled";
+        db.prepare(`UPDATE calls SET status = ?, duration = ?, endedAt = datetime('now') WHERE id = ?`).run(
+          finalStatus, durationSec, callId
+        );
+        emitToUser(otherId, "call_ended", { callId, duration: durationSec, reason: "Connection closed" });
+        activeCalls.delete(callId);
       }
     });
   });
@@ -752,6 +778,16 @@ setInterval(() => {
   for (const [callId, call] of activeCalls.entries()) {
     if (!call.connected && now - call.startedAt > 45_000) {
       db.prepare(`UPDATE calls SET status = 'missed', endedAt = datetime('now') WHERE id = ?`).run(callId);
+      const caller = db.prepare(`SELECT * FROM users WHERE id = ?`).get(call.callerId) as UserRow | undefined;
+      if (caller) {
+        const notif = createNotification(
+          call.receiverId,
+          "missed_call",
+          `Missed ${call.type} call from ${caller.username}`,
+          callId
+        );
+        emitToUser(call.receiverId, "notification", notif);
+      }
       emitToUser(call.callerId, "call_ended", { callId, reason: "No answer" });
       emitToUser(call.receiverId, "call_ended", { callId, reason: "No answer" });
       activeCalls.delete(callId);

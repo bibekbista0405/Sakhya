@@ -109,7 +109,7 @@ export function initDb(): void {
     CREATE TABLE IF NOT EXISTS notifications (
       id TEXT PRIMARY KEY,
       userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      type TEXT NOT NULL, -- message | friend_request | friend_accept | missed_call | incoming_call
+      type TEXT NOT NULL, -- message | friend_request | friend_accept | missed_call | incoming_call | new_device
       content TEXT NOT NULL,
       relatedId TEXT,
       isRead INTEGER NOT NULL DEFAULT 0,
@@ -188,6 +188,7 @@ export function initDb(): void {
       createdAt TEXT NOT NULL DEFAULT (datetime('now')),
       lastActiveAt TEXT NOT NULL DEFAULT (datetime('now')),
       revokedAt TEXT,
+      isPrimary INTEGER NOT NULL DEFAULT 0,
       UNIQUE(userId, curveIdentityKey)
     );
 
@@ -205,6 +206,32 @@ export function initDb(): void {
     CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(userId);
     CREATE INDEX IF NOT EXISTS idx_otk_device ON one_time_prekeys(deviceId);
     CREATE INDEX IF NOT EXISTS idx_otk_unclaimed ON one_time_prekeys(deviceId, claimedAt);
+  `);
+
+  const deviceCols = (db.prepare(`PRAGMA table_info(devices)`).all() as { name: string }[]).map((c) => c.name);
+  if (!deviceCols.includes("isPrimary")) {
+    db.exec(`ALTER TABLE devices ADD COLUMN isPrimary INTEGER NOT NULL DEFAULT 0`);
+    const firstDevices = db.prepare(`SELECT userId, MIN(createdAt) AS firstCreatedAt FROM devices GROUP BY userId`).all() as { userId: string; firstCreatedAt: string }[];
+    const markPrimary = db.prepare(`UPDATE devices SET isPrimary = 1 WHERE userId = ? AND createdAt = ?`);
+    for (const row of firstDevices) markPrimary.run(row.userId, row.firstCreatedAt);
+  }
+
+  // Phase 10: short-lived device-pairing approvals. Only a hash of the
+  // pairing secret is stored; the QR secret itself never reaches the database.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS device_pairings (
+      id TEXT PRIMARY KEY,
+      userId TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      secretHash TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      createdAt TEXT NOT NULL DEFAULT (datetime('now')),
+      expiresAt TEXT NOT NULL,
+      approvedAt TEXT,
+      approvedByDeviceId TEXT REFERENCES devices(id) ON DELETE SET NULL,
+      targetDeviceName TEXT NOT NULL DEFAULT 'New device'
+    );
+    CREATE INDEX IF NOT EXISTS idx_device_pairings_user ON device_pairings(userId, status);
+    CREATE INDEX IF NOT EXISTS idx_device_pairings_expiry ON device_pairings(expiresAt);
   `);
 
   // Link an auth session to the E2EE device it authenticated for, so revoking a

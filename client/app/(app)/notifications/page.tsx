@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo } from "react";
-import { Bell, MessageCircle, UserPlus, UserCheck, PhoneMissed, PhoneIncoming } from "lucide-react";
+import { Bell, MessageCircle, UserPlus, UserCheck, PhoneMissed, PhoneIncoming, ShieldCheck } from "lucide-react";
 import Link from "next/link";
 import { useNotifications } from "@/hooks/useNotifications";
 import { cn, formatTime } from "@/lib/utils";
@@ -16,6 +16,7 @@ const ICONS: Record<Notification["type"], typeof Bell> = {
   friend_accept: UserCheck,
   missed_call: PhoneMissed,
   incoming_call: PhoneIncoming,
+  new_device: ShieldCheck,
 };
 
 function linkFor(n: Notification): string {

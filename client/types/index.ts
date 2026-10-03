@@ -82,7 +82,7 @@ export interface Call {
 export interface Notification {
   id: string;
   userId: string;
-  type: "message" | "friend_request" | "friend_accept" | "missed_call" | "incoming_call";
+  type: "message" | "friend_request" | "friend_accept" | "missed_call" | "incoming_call" | "new_device";
   content: string;
   relatedId: string | null;
   isRead: number;

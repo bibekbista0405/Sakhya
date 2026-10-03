@@ -251,3 +251,8 @@ auto-migrated in place the next time the server starts — no need to delete it.
 ### Navigation performance
 
 Primary navigation uses Next.js `Link` directly. Manual hover/touch prefetching and global route warmup were removed to prevent competing route requests that could make tab navigation feel delayed or require repeated clicks, especially in development.
+
+
+## Current security phase
+
+**Phase 10 — Multi-Device Security & Pairing** is implemented. See `SAKHYA_PHASE10_FIXES.md` for the security model and recommended Git commit.

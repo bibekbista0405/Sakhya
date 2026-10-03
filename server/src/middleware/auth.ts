@@ -51,8 +51,8 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
   }
 
   const session = db
-    .prepare(`SELECT id, expiresAt FROM sessions WHERE tokenHash = ? AND userId = ?`)
-    .get(hashSessionToken(token), payload.userId) as { id: string; expiresAt: string } | undefined;
+    .prepare(`SELECT id, expiresAt, deviceId FROM sessions WHERE tokenHash = ? AND userId = ?`)
+    .get(hashSessionToken(token), payload.userId) as { id: string; expiresAt: string; deviceId: string | null } | undefined;
 
   if (!session) {
     res.status(401).json({ error: "Session has been revoked" });
@@ -67,6 +67,7 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
   // Best-effort activity heartbeat; failure here must never block the request.
   try {
     db.prepare(`UPDATE sessions SET lastActiveAt = datetime('now') WHERE id = ?`).run(session.id);
+    if (session.deviceId) db.prepare(`UPDATE devices SET lastActiveAt = datetime('now') WHERE id = ? AND userId = ? AND revokedAt IS NULL`).run(session.deviceId, payload.userId);
   } catch {
     // non-fatal
   }

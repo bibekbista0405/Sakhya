@@ -1,5 +1,6 @@
 import { Router, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
+import crypto from "crypto";
 import { db } from "../db";
 import { requireAuth, AuthedRequest, describeDevice } from "../middleware/auth";
 import { DeviceRow, PrekeyBundle, PublicDevice } from "../types";
@@ -18,6 +19,14 @@ function isBase64Key(value: unknown, minLen = 16, maxLen = 256): value is string
     value.length <= maxLen &&
     /^[A-Za-z0-9+/]+={0,2}$/.test(value)
   );
+}
+
+function hashPairingSecret(secret: string): string {
+  return crypto.createHash("sha256").update(secret, "utf8").digest("hex");
+}
+
+function randomPairingSecret(): string {
+  return crypto.randomBytes(24).toString("base64url");
 }
 
 function toPublicDevice(row: DeviceRow): PublicDevice {
@@ -74,6 +83,7 @@ router.post("/register", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequ
     deviceNameOverride || existing?.name || describeDevice(req.headers["user-agent"] as string | undefined);
 
   let deviceId: string;
+  const hadExistingDevices = !!db.prepare(`SELECT 1 FROM devices WHERE userId = ? LIMIT 1`).get(userId);
   if (existing) {
     if (existing.revokedAt) {
       // A revoked cryptographic identity is permanently dead. Never resurrect
@@ -95,9 +105,10 @@ router.post("/register", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequ
     );
   } else {
     deviceId = uuidv4();
+    const hasPrimary = db.prepare(`SELECT 1 FROM devices WHERE userId = ? AND isPrimary = 1 LIMIT 1`).get(userId);
     db.prepare(
-      `INSERT INTO devices (id, userId, name, curveIdentityKey, ed25519IdentityKey, fallbackKeyId, fallbackKey, fallbackKeySignature)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO devices (id, userId, name, curveIdentityKey, ed25519IdentityKey, fallbackKeyId, fallbackKey, fallbackKeySignature, isPrimary)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       deviceId,
       userId,
@@ -106,7 +117,14 @@ router.post("/register", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequ
       ed25519IdentityKey,
       fallbackKeyId || null,
       fallbackKey || null,
-      fallbackKeySignature || null
+      fallbackKeySignature || null,
+      hasPrimary ? 0 : 1
+    );
+  }
+
+  if (!existing && hadExistingDevices) {
+    db.prepare(`INSERT INTO notifications (id,userId,type,content,relatedId) VALUES (?,?,?,?,?)`).run(
+      uuidv4(), userId, "new_device", `New Sakhya device registered: ${deviceName}`, deviceId
     );
   }
 
@@ -270,10 +288,12 @@ router.get("/identity/:userId", requireAuth, (req: AuthedRequest, res: Response)
   res.json({ userId: targetUserId, devices: devices.map(toPublicDevice) });
 });
 
+db.prepare(`DELETE FROM device_pairings WHERE datetime(expiresAt) < datetime('now')`).run();
+
 /** List the current account's own registered devices (crypto identity, not just login sessions). */
 router.get("/", requireAuth, (req: AuthedRequest, res: Response) => {
   const rows = db
-    .prepare(`SELECT * FROM devices WHERE userId = ? AND revokedAt IS NULL ORDER BY lastActiveAt DESC`)
+    .prepare(`SELECT * FROM devices WHERE userId = ? AND revokedAt IS NULL ORDER BY isPrimary DESC, lastActiveAt DESC`)
     .all(req.user!.userId) as DeviceRow[];
 
   const remainingKeys = db
@@ -285,11 +305,15 @@ router.get("/", requireAuth, (req: AuthedRequest, res: Response) => {
     .all(...rows.map((r) => r.id)) as { deviceId: string; c: number }[];
   const remainingByDevice = new Map(remainingKeys.map((r) => [r.deviceId, r.c]));
 
+  const currentSession = req.sessionId ? db.prepare(`SELECT deviceId FROM sessions WHERE id = ? AND userId = ?`).get(req.sessionId, req.user!.userId) as {deviceId:string|null}|undefined : undefined;
+
   res.json({
     devices: rows.map((r) => ({
       ...toPublicDevice(r),
       remainingOneTimeKeys: remainingByDevice.get(r.id) ?? 0,
       lowOnKeys: (remainingByDevice.get(r.id) ?? 0) < MIN_ONE_TIME_KEY_POOL_WARNING,
+      isPrimary: !!r.isPrimary,
+      isCurrent: currentSession?.deviceId === r.id,
     })),
   });
 });
@@ -300,18 +324,64 @@ router.get("/", requireAuth, (req: AuthedRequest, res: Response) => {
  * Existing Olm sessions other devices already hold are unaffected by this —
  * they must independently detect the identity-key change (Phase 3).
  */
+router.patch("/:id", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequest, res: Response) => {
+  const name = sanitizeString(req.body?.name, 60);
+  if (!name) { res.status(400).json({ error: "Device name is required" }); return; }
+  const result = db.prepare(`UPDATE devices SET name = ? WHERE id = ? AND userId = ? AND revokedAt IS NULL`).run(name, req.params.id, req.user!.userId);
+  if (!result.changes) { res.status(404).json({ error: "Device not found" }); return; }
+  res.json({ success: true, name });
+});
+
 router.delete("/:id", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequest, res: Response) => {
   const userId = req.user!.userId;
-  const device = db.prepare(`SELECT id FROM devices WHERE id = ? AND userId = ?`).get(req.params.id, userId);
-  if (!device) {
-    res.status(404).json({ error: "Device not found" });
-    return;
-  }
+  const device = db.prepare(`SELECT id FROM devices WHERE id = ? AND userId = ? AND revokedAt IS NULL`).get(req.params.id, userId);
+  if (!device) { res.status(404).json({ error: "Device not found" }); return; }
   db.prepare(`UPDATE devices SET revokedAt = datetime('now') WHERE id = ?`).run(req.params.id);
   db.prepare(`DELETE FROM one_time_prekeys WHERE deviceId = ? AND claimedAt IS NULL`).run(req.params.id);
-  // Revoking the crypto device also logs out any auth session tied to it.
   db.prepare(`DELETE FROM sessions WHERE deviceId = ?`).run(req.params.id);
   res.json({ success: true });
+});
+
+router.post("/revoke-others", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequest, res: Response) => {
+  const current = req.sessionId ? db.prepare(`SELECT deviceId FROM sessions WHERE id = ? AND userId = ?`).get(req.sessionId, req.user!.userId) as {deviceId: string | null} | undefined : undefined;
+  if (!current?.deviceId) { res.status(409).json({ error: "Current device is not registered yet" }); return; }
+  const devices = db.prepare(`SELECT id FROM devices WHERE userId = ? AND id != ? AND revokedAt IS NULL`).all(req.user!.userId, current.deviceId) as {id:string}[];
+  const revoke = db.transaction((ids: string[]) => {
+    for (const id of ids) {
+      db.prepare(`UPDATE devices SET revokedAt = datetime('now') WHERE id = ?`).run(id);
+      db.prepare(`DELETE FROM one_time_prekeys WHERE deviceId = ? AND claimedAt IS NULL`).run(id);
+      db.prepare(`DELETE FROM sessions WHERE deviceId = ?`).run(id);
+    }
+  });
+  revoke(devices.map(d => d.id));
+  res.json({ success: true, revokedCount: devices.length });
+});
+
+router.post("/pairing/create", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequest, res: Response) => {
+  const secret = randomPairingSecret();
+  const id = uuidv4();
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  const device = req.sessionId ? db.prepare(`SELECT deviceId FROM sessions WHERE id = ? AND userId = ?`).get(req.sessionId, req.user!.userId) as {deviceId:string|null}|undefined : undefined;
+  db.prepare(`INSERT INTO device_pairings (id,userId,secretHash,expiresAt,approvedByDeviceId,targetDeviceName) VALUES (?,?,?,?,?,?)`).run(id, req.user!.userId, hashPairingSecret(secret), expiresAt, device?.deviceId ?? null, sanitizeString(req.body?.targetDeviceName,60) || "New device");
+  res.status(201).json({ pairingId: id, secret, expiresAt, payload: `sakhya-pair:v1:${id}:${secret}` });
+});
+
+router.post("/pairing/approve", requireAuth, sensitiveSettingsLimiter, (req: AuthedRequest, res: Response) => {
+  const pairingId = sanitizeString(req.body?.pairingId, 100);
+  const secret = sanitizeString(req.body?.secret, 200);
+  if (!pairingId || !secret) { res.status(400).json({ error: "Pairing code is required" }); return; }
+  const pairing = db.prepare(`SELECT * FROM device_pairings WHERE id = ? AND userId = ?`).get(pairingId, req.user!.userId) as any;
+  if (!pairing || pairing.status !== "pending" || new Date(pairing.expiresAt).getTime() < Date.now()) { res.status(410).json({ error: "Pairing request expired or already used" }); return; }
+  if (!crypto.timingSafeEqual(Buffer.from(pairing.secretHash), Buffer.from(hashPairingSecret(secret)))) { res.status(403).json({ error: "Invalid pairing code" }); return; }
+  const sessionDevice = req.sessionId ? db.prepare(`SELECT deviceId FROM sessions WHERE id = ?`).get(req.sessionId) as {deviceId:string|null}|undefined : undefined;
+  db.prepare(`UPDATE device_pairings SET status = 'approved', approvedAt = datetime('now'), approvedByDeviceId = ? WHERE id = ?`).run(sessionDevice?.deviceId ?? null, pairingId);
+  res.json({ success: true });
+});
+
+router.get("/pairing/:id", requireAuth, (req: AuthedRequest, res: Response) => {
+  const pairing = db.prepare(`SELECT id,status,expiresAt,targetDeviceName FROM device_pairings WHERE id = ? AND userId = ?`).get(req.params.id, req.user!.userId) as any;
+  if (!pairing || new Date(pairing.expiresAt).getTime() < Date.now()) { res.status(410).json({ error: "Pairing request expired" }); return; }
+  res.json({ pairingId: pairing.id, status: pairing.status, expiresAt: pairing.expiresAt, targetDeviceName: pairing.targetDeviceName });
 });
 
 export default router;

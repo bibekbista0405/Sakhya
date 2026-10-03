@@ -102,10 +102,34 @@ export interface CallRow {
   endedAt: string | null;
 }
 
+export interface DeviceRow {
+  id: string;
+  userId: string;
+  name: string;
+  curveIdentityKey: string;
+  ed25519IdentityKey: string;
+  fallbackKeyId: string | null;
+  fallbackKey: string | null;
+  fallbackKeySignature: string | null;
+  createdAt: string;
+  lastActiveAt: string;
+  revokedAt: string | null;
+  isPrimary: number;
+}
+
+export interface PublicDevice {
+  id: string;
+  name: string;
+  curveIdentityKey: string;
+  ed25519IdentityKey: string;
+  createdAt: string;
+  lastActiveAt: string;
+}
+
 export interface NotificationRow {
   id: string;
   userId: string;
-  type: "message" | "friend_request" | "friend_accept" | "missed_call" | "incoming_call";
+  type: "message" | "friend_request" | "friend_accept" | "missed_call" | "incoming_call" | "new_device";
   content: string;
   relatedId: string | null;
   isRead: number;
@@ -118,29 +142,6 @@ export interface NotificationRow {
 // and kept on the user's device (e.g. in IndexedDB) and never transmitted.
 // Cryptography uses the Olm Double Ratchet implementation (the same
 // construction underlying the Signal Protocol), not a custom scheme.
-
-export interface DeviceRow {
-  id: string;
-  userId: string;
-  name: string;
-  curveIdentityKey: string; // Curve25519 public identity key, base64
-  ed25519IdentityKey: string; // Ed25519 public signing key, base64
-  fallbackKeyId: string | null;
-  fallbackKey: string | null; // signed fallback one-time prekey, used when the OTK pool is empty
-  fallbackKeySignature: string | null;
-  createdAt: string;
-  lastActiveAt: string;
-  revokedAt: string | null;
-}
-
-export interface PublicDevice {
-  id: string;
-  name: string;
-  curveIdentityKey: string;
-  ed25519IdentityKey: string;
-  createdAt: string;
-  lastActiveAt: string;
-}
 
 export interface OneTimePrekeyRow {
   id: string;
